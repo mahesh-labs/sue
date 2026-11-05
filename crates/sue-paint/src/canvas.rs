@@ -827,12 +827,41 @@ impl SuePaint {
 
     /// How hard the pen presses, through the pen pressure curve: from the
     /// window's touch events (Windows Ink, macOS, phones), else from a
-    /// WinTab tablet, Wayland's tablet protocol or a pen in a browser, else
-    /// full (a mouse).
+    /// WinTab tablet, Wayland's tablet protocol, X11's XInput2 or a pen in a
+    /// browser, else full (a mouse).
     fn pen_pressure(&self) -> f32 {
         self.pressure
             .or_else(|| sue_platform::stylus::pressure().map(|raw| self.pen_curve.eval(raw)))
             .unwrap_or(1.0)
+    }
+
+    /// How far the pen leans `[tilt_x, tilt_y]` in degrees in the picture's
+    /// space, turned and mirrored with the canvas view so flat and calligraphic
+    /// tips follow the physical pen on screen.
+    fn pen_tilt(&self) -> [f32; 2] {
+        let raw = self.stylus_tilt.unwrap_or_else(sue_platform::stylus::tilt);
+        if raw == [0.0, 0.0] {
+            return raw;
+        }
+        let Some(doc) = self.docs.get(self.active) else {
+            return raw;
+        };
+        let (sin, cos) = (-doc.view.rotation).to_radians().sin_cos();
+        let mut tx = raw[0] * cos - raw[1] * sin;
+        let mut ty = raw[0] * sin + raw[1] * cos;
+        if doc.view.flip_h {
+            tx = -tx;
+        }
+        if doc.view.flip_v {
+            ty = -ty;
+        }
+        [tx, ty]
+    }
+
+    /// Whether the pen's eraser end or eraser switch is active.
+    fn pen_eraser(&self) -> bool {
+        self.stylus_eraser
+            .unwrap_or_else(sue_platform::stylus::eraser)
     }
 
     /// The first time a pen's pressure shows up while its curve is still
@@ -860,16 +889,26 @@ impl SuePaint {
     ) {
         let ctx = ui.ctx().clone();
         let blocked = self.dialog.is_some() || self.menubar.is_open() || !self.ready;
-        let (events, space, time, dt, held) = ctx.input(|input| {
+        let mut stylus_samples = if blocked {
+            std::collections::VecDeque::new()
+        } else {
+            sue_platform::stylus::take_samples()
+        };
+        let (events, space, time, dt, held, pointer_gone) = ctx.input(|input| {
             (
                 input.events.clone(),
                 input.key_down(Key::Space),
                 input.time,
                 input.unstable_dt,
                 input.modifiers,
+                input.pointer.hover_pos().is_none(),
             )
         });
-        if sue_platform::stylus::pressure().is_some() {
+        if sue_platform::stylus::pressure().is_some()
+            || stylus_samples
+                .iter()
+                .any(|sample| sample.pressure.is_some())
+        {
             self.pen_seen(cx);
         }
         // Studio Mode's modifier keys count as held.
@@ -894,6 +933,17 @@ impl SuePaint {
             sue_wm::cover::covered(&ctx, layer, pos)
                 || launchers.iter().any(|bar| bar.expand(2.0).contains(pos))
         };
+        let pop_sample =
+            |samples: &mut std::collections::VecDeque<sue_platform::stylus::Sample>,
+             kind: sue_platform::stylus::SampleKind,
+             pos: Pos2| {
+                let matches = samples.front().is_some_and(|front| {
+                    front.kind == kind
+                        && (front.pos[0] - pos.x).abs() <= 1e-3
+                        && (front.pos[1] - pos.y).abs() <= 1e-3
+                });
+                matches.then(|| samples.pop_front()).flatten()
+            };
         self.pointer = response.hover_pos().filter(|pos| !covered(*pos));
         let mut lifted = false;
         for event in events {
@@ -934,12 +984,24 @@ impl SuePaint {
                     pressed: true,
                     modifiers,
                 } => {
+                    if let Some(sample) = pop_sample(
+                        &mut stylus_samples,
+                        sue_platform::stylus::SampleKind::Press,
+                        pos,
+                    ) {
+                        self.pressure = sample.pressure.map(|raw| self.pen_curve.eval(raw));
+                        self.stylus_tilt = Some(sample.tilt);
+                        self.stylus_eraser = Some(sample.eraser);
+                    }
                     // Two fingers down are a pinch or a pan, never a stroke.
+                    // When a fast pen tap enters, presses and leaves proximity
+                    // in one frame, `hover_pos()` is `None` (`pointer_gone`)
+                    // even though `pos` landed inside `viewport`.
                     if blocked
                         || self.gesture.is_some()
                         || self.touches.len() >= 2
                         || !viewport.contains(pos)
-                        || !response.hovered()
+                        || !(response.hovered() || pointer_gone)
                         || covered(pos)
                     {
                         continue;
@@ -958,22 +1020,53 @@ impl SuePaint {
                     }
                 }
                 Event::PointerMoved(pos) => {
+                    if let Some(sample) = pop_sample(
+                        &mut stylus_samples,
+                        sue_platform::stylus::SampleKind::Move,
+                        pos,
+                    ) {
+                        self.pressure = sample.pressure.map(|raw| self.pen_curve.eval(raw));
+                        self.stylus_tilt = Some(sample.tilt);
+                        self.stylus_eraser = Some(sample.eraser);
+                    }
                     self.clock.0 += f64::from(self.clock.1);
                     self.drag(pos, viewport, size, cx);
                 }
                 Event::PointerButton {
                     pos,
+                    button,
                     pressed: false,
                     ..
-                } if self.gesture.is_some() => {
-                    self.drag(pos, viewport, size, cx);
-                    self.release(viewport, size, cx);
+                } => {
+                    if let Some(sample) = pop_sample(
+                        &mut stylus_samples,
+                        sue_platform::stylus::SampleKind::Release,
+                        pos,
+                    ) {
+                        if let Some(raw) = sample.pressure {
+                            self.pressure = Some(self.pen_curve.eval(raw));
+                        }
+                        self.stylus_tilt = Some(sample.tilt);
+                        self.stylus_eraser = Some(sample.eraser);
+                        if button == PointerButton::Primary {
+                            lifted = true;
+                        }
+                    }
+                    if self.gesture.is_some() {
+                        self.drag(pos, viewport, size, cx);
+                        self.release(viewport, size, cx);
+                    }
+                }
+                Event::PointerGone => {
+                    lifted = true;
                 }
                 _ => {}
             }
         }
         if lifted {
             self.pressure = None;
+            self.stylus_tilt = None;
+            self.stylus_eraser = None;
         }
         // Two fingers or more move, zoom and turn the view.
         let pinch = ctx
@@ -1193,6 +1286,9 @@ impl SuePaint {
             self.stamp = Some(([p.x, p.y], None));
             cx.notify(tr!("copy-stamp-source-set"));
             return;
+        } else if self.pen_eraser() && tool.paints() && tool != Tool::Eraser && tool != Tool::Figure
+        {
+            tool = Tool::Eraser;
         } else if modifiers.alt && tool.paints() && tool != Tool::Eraser && tool != Tool::Figure {
             match alt_does.as_str() {
                 "eyedropper" => tool = Tool::Eyedropper,
@@ -1351,6 +1447,7 @@ impl SuePaint {
                 let mut stabilizer = Stabilizer::new(sub.stabilization, sub.adjust_by_speed);
                 let start = stabilizer.sample(local, doc.view.zoom, self.clock.1);
                 let pressure = self.pen_pressure();
+                stroke.set_tilt(self.pen_tilt());
                 // Vector lines are kept whole, not cut by the selection.
                 let selection = (!vector)
                     .then(|| shifted.as_ref().or(doc.selection.as_ref()))
@@ -2698,6 +2795,7 @@ impl SuePaint {
             return;
         }
         let pressure = self.pen_pressure();
+        let tilt = self.pen_tilt();
         let (time, step) = self.clock;
         let (Some(gesture), Some(doc)) = (self.gesture.as_mut(), self.docs.get_mut(self.active))
         else {
@@ -2741,6 +2839,7 @@ impl SuePaint {
                 let smooth = stabilizer.sample(local, doc.view.zoom, step);
                 let smooth = snap.as_ref().map_or(smooth, |snap| snap.project(smooth));
                 // Fast is 2000 screen points a second (velocity dynamics).
+                stroke.set_tilt(tilt);
                 stroke.set_speed(stabilizer.speed() / 2000.0);
                 let selection = (!*vector)
                     .then(|| shifted.as_ref().or(doc.selection.as_ref()))
@@ -2904,6 +3003,7 @@ impl SuePaint {
             return;
         };
         let pressure = self.pen_pressure();
+        let tilt = self.pen_tilt();
         match gesture {
             Gesture::Stroke {
                 mut stroke,
@@ -2952,11 +3052,14 @@ impl SuePaint {
                     flick: fast.filter(|_| flick),
                 };
                 // A pen's touch ends before its button does, so the last
-                // points keep the stroke's own last pressure, not a full one.
+                // points keep the stroke's own last pressure and tilt, not a
+                // full pressure or upright tilt.
                 let last = stroke
                     .samples()
                     .last()
                     .map_or(pressure, |sample| sample.pressure);
+                let last_tilt = stroke.samples().last().map_or(tilt, |sample| sample.tilt);
+                stroke.set_tilt(last_tilt);
                 let mut drawn = None;
                 if let Some(raster) = doc::raster_mut(&mut cx.world.arena, layer) {
                     if smart {

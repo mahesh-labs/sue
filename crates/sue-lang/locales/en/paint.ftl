@@ -2351,3 +2351,9 @@ ruby-hint = Reading for the selected words
 set-ruby = Set ruby
 remove-ruby = Remove ruby
 ruby-needs-selection = Select the words to read while typing, and type their reading
+
+pen-tilt = Pen tilt
+pen-tilt-settings = Pen tilt settings
+upright = Upright
+tilted = Tilted
+turn-with-pen-tilt = Turn with pen tilt

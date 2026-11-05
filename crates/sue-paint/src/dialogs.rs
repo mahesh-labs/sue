@@ -2921,10 +2921,13 @@ fn pressure_ui(ui: &mut Ui, pressure: &mut PressureDialog, theme: &Theme) -> Out
             _ => None,
         })
     });
+    let queued = sue_platform::stylus::take_samples();
     if let Some(force) = touch {
         pressure.force = force.map(|force| force.clamp(0.0, 1.0));
+    } else if let Some(last_touching) = queued.iter().rev().find_map(|sample| sample.pressure) {
+        pressure.force = Some(last_touching);
     } else if sue_platform::stylus::source().is_some() {
-        // A WinTab tablet or a pen in a browser.
+        // A WinTab, Wayland or X11 tablet, or a pen in a browser.
         pressure.force = sue_platform::stylus::pressure();
     }
     if response.drag_started() {
@@ -2934,15 +2937,30 @@ fn pressure_ui(ui: &mut Ui, pressure: &mut PressureDialog, theme: &Theme) -> Out
         }
     }
     if response.dragged()
-        && let (Some(pos), Some(line)) =
-            (response.interact_pointer_pos(), pressure.lines.last_mut())
+        && let Some(line) = pressure.lines.last_mut()
     {
-        let raw = pressure.force.unwrap_or(1.0);
-        line.push((pos - pad.min, raw));
-        if let Some(force) = pressure.force
-            && pressure.raw.len() < 4000
-        {
-            pressure.raw.push(force);
+        let mut added_queued = false;
+        for sample in &queued {
+            let Some(raw) = sample.pressure else {
+                continue;
+            };
+            let pt = pos2(sample.pos[0], sample.pos[1]);
+            if pad.contains(pt) {
+                line.push((pt - pad.min, raw));
+                if pressure.raw.len() < 4000 {
+                    pressure.raw.push(raw);
+                }
+                added_queued = true;
+            }
+        }
+        if !added_queued && let Some(pos) = response.interact_pointer_pos() {
+            let raw = pressure.force.unwrap_or(1.0);
+            line.push((pos - pad.min, raw));
+            if let Some(force) = pressure.force
+                && pressure.raw.len() < 4000
+            {
+                pressure.raw.push(force);
+            }
         }
     }
     let painter = ui.painter_at(pad);

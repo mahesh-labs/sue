@@ -235,10 +235,48 @@ pub struct DesktopHost {
     /// the first frame looks for one, then whether there is one.
     #[cfg(target_os = "windows")]
     tablet: Option<Option<crate::wintab_pen::Tablet>>,
-    /// A pen on Wayland's tablet protocol (see `crate::wayland_pen`): `None`
-    /// until the loop first looks for one, then whether there is one.
-    #[cfg(target_os = "linux")]
-    pen: Option<Option<crate::wayland_pen::Pen>>,
+    /// A tablet on Wayland's `tablet-v2` protocol or X11's XInput2: `None`
+    /// until the loop first looks for one.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pen: Option<UnixTablet>,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+enum UnixTablet {
+    Wayland(crate::wayland_pen::Pen),
+    X11(crate::x11_pen::Tablet),
+    None,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+impl UnixTablet {
+    fn open(window: &Arc<Window>) -> Self {
+        if let Some(pen) = crate::wayland_pen::Pen::open(window) {
+            Self::Wayland(pen)
+        } else if let Some(tablet) = crate::x11_pen::Tablet::open(window) {
+            Self::X11(tablet)
+        } else {
+            Self::None
+        }
+    }
 }
 
 impl std::fmt::Debug for DesktopHost {
@@ -460,25 +498,45 @@ impl DesktopHost {
             viewports,
             #[cfg(target_os = "windows")]
             tablet: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
             pen: None,
         })
     }
 
-    /// Reads the pen on Wayland's tablet protocol, asking for a frame when
-    /// it moved. Returns when the loop should look again.
-    #[cfg(target_os = "linux")]
+    /// Reads the pen on Wayland's `tablet-v2` protocol or X11's XInput2,
+    /// asking for a frame when it moved. Returns when the loop should look
+    /// again while the pen hovers over Sue's window.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
     fn poll_pen(&mut self) -> Option<Instant> {
-        let to_points = self.window.scale_factor() as f32 / self.ctx.pixels_per_point();
+        let scale_factor = self.window.scale_factor();
+        let to_points = scale_factor as f32 / self.ctx.pixels_per_point();
+        let scale = scale_factor.round().max(1.0) as i32;
         let window = &self.window;
-        let pen = self
-            .pen
-            .get_or_insert_with(|| crate::wayland_pen::Pen::open(window))
-            .as_mut()?;
-        if pen.poll(to_points) {
-            window.request_redraw();
+        match self.pen.get_or_insert_with(|| UnixTablet::open(window)) {
+            UnixTablet::Wayland(pen) => {
+                if pen.poll(to_points, scale) {
+                    window.request_redraw();
+                }
+                pen.wake_after().map(|after| Instant::now() + after)
+            }
+            UnixTablet::X11(tablet) => {
+                tablet.poll();
+                None
+            }
+            UnixTablet::None => None,
         }
-        Some(Instant::now() + pen.wake_after())
     }
 
     /// The GPU objects.
@@ -528,15 +586,48 @@ impl DesktopHost {
                 tablet.poll();
             }
         }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
+        let _ = self.poll_pen();
         #[cfg_attr(
-            not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")),
+            not(any(
+                target_os = "android",
+                target_os = "ios",
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_arch = "wasm32",
+            )),
             allow(unused_mut)
         )]
         let mut raw = self.egui.take_egui_input(&self.window);
-        // The pen's moves, touches and lifts from Wayland's tablet protocol.
-        #[cfg(target_os = "linux")]
-        if let Some(Some(pen)) = self.pen.as_mut() {
-            let modifiers = self.ctx.input(|input| input.modifiers);
+        // The pen's moves, touches, barrel buttons and lifts from Wayland's
+        // tablet protocol.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
+        if let Some(UnixTablet::Wayland(pen)) = self.pen.as_mut() {
+            let modifiers = raw
+                .events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    egui::Event::Key { modifiers, .. }
+                    | egui::Event::PointerButton { modifiers, .. } => Some(*modifiers),
+                    _ => None,
+                })
+                .unwrap_or_else(|| self.ctx.input(|input| input.modifiers));
             pen.take_events(modifiers, &mut raw.events);
         }
         // Where the window is, so a dialog's own window opens over it.
@@ -570,6 +661,20 @@ impl DesktopHost {
         }
         let ctx = self.ctx.clone();
         let output = ctx.run_ui(raw, |ui| app.ui(ui, self));
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
+        {
+            crate::stylus::end_frame();
+            if let Some(UnixTablet::Wayland(pen)) = self.pen.as_mut() {
+                let scale = self.window.scale_factor().round().max(1.0) as i32;
+                pen.set_cursor(output.platform_output.cursor_icon, scale);
+            }
+        }
         #[cfg(target_arch = "wasm32")]
         for command in &output.platform_output.commands {
             match command {
@@ -1021,8 +1126,15 @@ impl<A: DesktopApp> ApplicationHandler<Wake> for Runner<A> {
             self.last_frame,
             display_hz,
         );
-        // The pen's tablet protocol: read it now, and wake again soon.
-        #[cfg(target_os = "linux")]
+        // The pen's tablet protocol: read it now, and wake again soon while
+        // the pen hovers over the window.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
         let step = match (step, host.poll_pen()) {
             (Step::Wait, Some(at)) => Step::WaitUntil(at),
             (Step::WaitUntil(first), Some(at)) => Step::WaitUntil(first.min(at)),

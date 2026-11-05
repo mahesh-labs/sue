@@ -603,6 +603,10 @@ pub struct SuePaint {
     /// Playback starts over at the end.
     pub(crate) looping: bool,
     pub(crate) pressure: Option<f32>,
+    /// Per-event stylus tilt `[tilt_x, tilt_y]` in degrees when queued.
+    pub(crate) stylus_tilt: Option<[f32; 2]>,
+    /// Per-event stylus eraser-end flag when queued.
+    pub(crate) stylus_eraser: Option<bool>,
     /// The pen pressure curve every tool uses (Pen Pressure Settings).
     pub(crate) pen_curve: sue_model::Response,
     /// The hint about fitting pen pressure was given (once a run).
@@ -759,6 +763,8 @@ impl Default for SuePaint {
             cel_lock: None,
             looping: true,
             pressure: None,
+            stylus_tilt: None,
+            stylus_eraser: None,
             pen_curve: crate::dialogs::DEFAULT_PEN_PRESSURE
                 .parse()
                 .unwrap_or_default(),

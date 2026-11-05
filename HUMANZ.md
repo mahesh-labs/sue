@@ -65,10 +65,13 @@ palettes can leave the main window; in the browser and on phones they are
 drawn inside it, as egui does by itself. `unsafe` code is forbidden workspace-wide
 (`[workspace.lints] rust.unsafe_code = "forbid"`). The `wgpu` window surface is
 created through its safe API, so `sue-platform` keeps the lint too. Native FFI
-is relaxed only in its two small entry crates, each item approved by the
+is relaxed only in its small platform entry crates, each item approved by the
 maintainer: `crates/sue-platform/android` (the native activity's entry and the
-two raw JNI pointers it wraps) and `crates/sue-platform/ios` (UIKit's
-document picker and keyboard notifications); `sue-platform` calls Java
+two raw JNI pointers it wraps), `crates/sue-platform/ios` (UIKit's
+document picker and keyboard notifications) and `crates/sue-platform/wayland`
+(borrowing `winit`'s live `wl_display` and `wl_surface` pointers into safe
+`wayland-client` handles for `tablet-v2` on Linux and the BSDs); `sue-platform`
+calls Java
 through `jni`'s safe API.
 
 ---
@@ -1435,6 +1438,7 @@ clean without the brush feeling slow. A stroke passes through these stages:
 | Finishing on lift | The hooks a pen leaves when it touches down and lifts are trimmed; the samples become a centripetal Catmull-Rom spline (no loops or overshoot), so even a fast mouse that reported a few points ends as a curve; *post correction* (0 to 10) resamples the path evenly, finds deliberate corners (a turn of more than about 65 degrees over arms a brush wide, on a lightly smoothed copy) and smooths everything between them with a gaussian along the path that grows with the level and the brush; a quick *flick* (over 700 points per second) carries the line on along the pen's momentum. The stroke is then painted again from the finished path with its end tapered, the flick thinning to a point. |
 | Color mixing | Mixing brushes pick up the color under them and are reloaded with their own paint, both per distance travelled, so a stroke settles at the mix amount of the canvas color whatever the spacing. |
 | Starting and ending | Measured as Clip Studio Paint's How to specify offers: in pixels, as percentages of the whole stroke (exact once the pen lifts and the stroke is painted again), or Fade (gone by a length however long the stroke); they thin the brush, fade the paint or both, and with *by speed* quicker strokes get longer ones. |
+| Pen tilt and Linux tablets | On Linux and the BSDs, `sue_platform::wayland_pen` speaks `zwp_tablet_manager_v2` (up to v2) over `sue-wayland` and `sue_platform::x11_pen` speaks XInput 2.2 over `x11rb`, queuing 1-to-1 per-event `stylus::Sample`s (pressure, `[tilt_x, tilt_y]` and eraser state) alongside browser `PointerEvent` tilt. `Dynamics` evaluates pen tilt on its own curve (`tilt`, `tilt_min`, `tilt_curve`), `Tip::follow_tilt` aligns flat dabs with the pen's tilt azimuth rotated into canvas space, and vector layers persist per-point `"tilt"` attributes (`Domain::Point`, width 2). |
 | Color jitter | Per dab for brushes that stamp (hue, saturation, luminosity, toward the sub color) and per stroke for any brush, from steady chances along the path, so a repainted stroke keeps its colors. |
 
 A stroke never stacks on itself: each touched 64-pixel tile keeps its pixels

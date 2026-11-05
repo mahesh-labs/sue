@@ -95,7 +95,12 @@ pub fn svg_shapes(lines: &[Line], offset: [f32; 2]) -> Vec<sue_io::svg::SvgShape
                 .enumerate()
                 .map(|(index, sample)| {
                     let size = line.tip.size
-                        * line.tip.size_by.factor(sample.pressure, sample.speed, 1.0)
+                        * line.tip.size_by.factor_with_tilt(
+                            sample.pressure,
+                            sample.tilt_amount(),
+                            sample.speed,
+                            1.0,
+                        )
                         * sample.width;
                     // The ends come to their tapers' points.
                     let along = index as f32 / (count - 1) as f32;
@@ -165,6 +170,7 @@ impl Line {
         stroke.set_sub_color(self.colors[1]);
         stroke.set_copies(self.copies.clone());
         for sample in &self.samples {
+            stroke.set_tilt(sample.tilt);
             stroke.set_speed(sample.speed);
             stroke.set_shape(sample.width, sample.alpha);
             stroke.to(raster, sample.at, sample.pressure, None);
@@ -244,6 +250,7 @@ pub fn from_svg(drawing: &sue_io::svg::SvgDrawing, size: [u32; 2]) -> Vec<Line> 
                 .map(|[x, y]| Sample {
                     at: [x * scale, y * scale],
                     pressure: 1.0,
+                    tilt: [0.0, 0.0],
                     speed: 0.0,
                     width: 1.0,
                     alpha: 1.0,
@@ -457,6 +464,7 @@ pub fn trace(pixels: &[u8], width: u32, height: u32) -> Vec<Line> {
                 .map(|(at, width)| Sample {
                     at: *at,
                     pressure: 1.0,
+                    tilt: [0.0, 0.0],
                     speed: 0.0,
                     width: width / size,
                     alpha: 1.0,
@@ -518,6 +526,7 @@ pub fn lines(geometry: &Geometry) -> Vec<Line> {
     let points = geometry.points();
     let count = points.len();
     let pressure = floats(geometry, Domain::Point, "pressure", 1).filter(|v| v.len() == count);
+    let tilt = floats(geometry, Domain::Point, "tilt", 2).filter(|v| v.len() == count * 2);
     let speed = floats(geometry, Domain::Point, "speed", 1).filter(|v| v.len() == count);
     let width = floats(geometry, Domain::Point, "width", 1).filter(|v| v.len() == count);
     let alpha = floats(geometry, Domain::Point, "alpha", 1).filter(|v| v.len() == count);
@@ -552,6 +561,9 @@ pub fn lines(geometry: &Geometry) -> Vec<Line> {
                     Sample {
                         at: [x as f32, y as f32],
                         pressure: pressure.map_or(1.0, |values| values[index]),
+                        tilt: tilt.map_or([0.0, 0.0], |values| {
+                            [values[index * 2], values[index * 2 + 1]]
+                        }),
                         speed: speed.map_or(0.0, |values| values[index]),
                         width: width.map_or(1.0, |values| values[index]),
                         alpha: alpha.map_or(1.0, |values| values[index]),
@@ -612,6 +624,7 @@ pub fn lines(geometry: &Geometry) -> Vec<Line> {
 pub fn to_geometry(lines: &[Line]) -> Geometry {
     let mut geometry = Geometry::new();
     let (mut pressure, mut speed) = (Vec::new(), Vec::new());
+    let mut tilt: Vec<f32> = Vec::new();
     let (mut width, mut alpha) = (Vec::new(), Vec::new());
     let mut marks: Vec<i32> = Vec::new();
     let (mut colors, mut subs, mut flicks) = (Vec::new(), Vec::new(), Vec::new());
@@ -626,6 +639,7 @@ pub fn to_geometry(lines: &[Line]) -> Geometry {
             .iter()
             .map(|sample| {
                 pressure.push(sample.pressure);
+                tilt.extend(sample.tilt);
                 speed.push(sample.speed);
                 width.push(sample.width);
                 alpha.push(sample.alpha);
@@ -638,6 +652,7 @@ pub fn to_geometry(lines: &[Line]) -> Geometry {
             marks.push(0);
             let sample = line.samples[0];
             pressure.push(sample.pressure);
+            tilt.extend(sample.tilt);
             speed.push(sample.speed);
             width.push(sample.width);
             alpha.push(sample.alpha);
@@ -675,6 +690,7 @@ pub fn to_geometry(lines: &[Line]) -> Geometry {
     let int = |values: Vec<i32>| AttributeData::Int { width: 1, values };
     for (domain, name, data) in [
         (Domain::Point, "pressure", float(1, pressure)),
+        (Domain::Point, "tilt", float(2, tilt)),
         (Domain::Point, "speed", float(1, speed)),
         (Domain::Point, "width", float(1, width)),
         (Domain::Point, "alpha", float(1, alpha)),
@@ -812,6 +828,7 @@ pub(crate) fn at_arc(samples: &[Sample], arcs: &[f32], along: f32) -> Sample {
     Sample {
         at: [mix(a.at[0], b.at[0]), mix(a.at[1], b.at[1])],
         pressure: mix(a.pressure, b.pressure),
+        tilt: [mix(a.tilt[0], b.tilt[0]), mix(a.tilt[1], b.tilt[1])],
         speed: mix(a.speed, b.speed),
         width: mix(a.width, b.width),
         alpha: mix(a.alpha, b.alpha),
@@ -951,6 +968,7 @@ mod tests {
                         from[1] + (to[1] - from[1]) * t,
                     ],
                     pressure: 0.5 + t * 0.5,
+                    tilt: [0.0, 0.0],
                     speed: 0.2,
                     width: 1.0,
                     alpha: 1.0,
@@ -1095,6 +1113,7 @@ mod tests {
         let mut live = RasterTile2D::new(64, 64, PixelFormat::Rgba8).unwrap();
         let mut stroke = Stroke::new(EntityId::NIL, tip, [0.2, 0.1, 0.6], false);
         for step in 0..12 {
+            stroke.set_tilt([18.0, -9.0]);
             stroke.set_speed(0.3);
             let x = 8.0 + step as f32 * 4.0;
             stroke.to(&mut live, [x, 20.0 + (x * 0.2).sin() * 6.0], 0.8, None);
@@ -1110,14 +1129,36 @@ mod tests {
             samples: vec![Sample {
                 at: [50.0, 50.0],
                 pressure: 1.0,
+                tilt: [0.0, 0.0],
                 speed: 0.0,
                 width: 1.0,
                 alpha: 1.0,
             }],
             ..drawn.clone()
         };
-        let kept = lines(&to_geometry(&[drawn.clone(), dot.clone()]));
+        let geom = to_geometry(&[drawn.clone(), dot.clone()]);
+        let kept = lines(&geom);
         assert_eq!(kept, vec![drawn.clone(), dot]);
+        // Older `.sue` vector layers without a `tilt` point attribute read back
+        // with upright `[0.0, 0.0]` tilt.
+        let mut legacy = Geometry::new();
+        for &pt in geom.points() {
+            legacy.add_point(pt);
+        }
+        for prim in geom.prims() {
+            legacy.add_prim(prim.kind, geom.prim_points(prim)).unwrap();
+        }
+        for (domain, name, data) in geom.attributes() {
+            if !(domain == Domain::Point && name == "tilt") {
+                legacy.set_attribute(domain, name, data.clone()).unwrap();
+            }
+        }
+        assert!(
+            lines(&legacy)[0]
+                .samples
+                .iter()
+                .all(|s| s.tilt == [0.0, 0.0])
+        );
         let again = render(&[drawn], 64, 64).unwrap();
         assert_eq!(again.bytes(), live.bytes(), "the same pixels");
     }

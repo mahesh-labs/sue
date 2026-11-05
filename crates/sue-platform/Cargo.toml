@@ -58,9 +58,14 @@ sue-ios = { path = "ios" }
 wintab.workspace = true
 windows.workspace = true
 
-# Pen pressure on Linux (Wayland's tablet protocol; winit does not carry it).
-[target.'cfg(target_os = "linux")'.dependencies]
-octotablet.workspace = true
+# Pen position, pressure, tilt, barrel buttons and eraser on Linux and BSDs
+# (Wayland's tablet-v2 protocol and X11's XInput2, which winit does not carry).
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+sue-wayland = { path = "wayland" }
+wayland-client.workspace = true
+wayland-cursor.workspace = true
+wayland-protocols.workspace = true
+x11rb.workspace = true
 
 # The browser: WebGPU with WebGL2 as the fallback, its page, storage,
 # clipboard and file pickers, and a clock (std's panics there). The

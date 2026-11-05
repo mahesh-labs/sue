@@ -481,6 +481,10 @@ Once a canvas is open:
 - **Drawing tablets:** pressure works with Windows Ink and with WinTab, so
   Huion, XP-Pen and Wacom tablets work whether or not Windows Ink is turned
   on in their driver. In the browser version, a pen's pressure works too.
+  On Linux, drawing tablets and pen displays work natively on both Wayland
+  (`tablet-v2`) and X11 (`XInput2`), with cursor tracking, barrel buttons,
+  the pen's eraser end, pressure and pen tilt (for Brush Size and Opacity
+  dynamics as well as **Turn with pen tilt** in Brush Tip).
 - **Clean lines without lag:** pens smooth out the shake of your hand, and
   smooth less the faster you move ("Adjust by speed"). However fast you
   draw, the line never falls more than a short way behind the pen, and when

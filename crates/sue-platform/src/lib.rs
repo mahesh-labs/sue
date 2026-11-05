@@ -58,12 +58,26 @@ pub mod update;
 mod vfs;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
 mod viewports;
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
 mod wayland_pen;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
 #[cfg(target_os = "windows")]
 mod wintab_pen;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd",
+))]
+mod x11_pen;
 
 pub use audio::{
     AudioConfig, AudioOutput, AudioSink, AudioStreamInfo, NullAudio, RealtimeStatus,

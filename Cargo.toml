@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "crates/sue-platform/android", "crates/sue-platform/ios", "bins/*"]
+members = ["crates/*", "crates/sue-platform/android", "crates/sue-platform/ios", "crates/sue-platform/wayland", "bins/*"]
 
 [workspace.package]
 version = "0.0.74"
@@ -52,9 +52,14 @@ jxl-oxide = "0.12"
 pollster = "1"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "gles", "vulkan", "wgsl"] }
 winit = "0.30"
-# Pen position and pressure on Linux from Wayland's tablet protocol, which
-# winit does not carry. Its safe `build_shared` needs no unsafe code.
-octotablet = { version = "0.1", default-features = false, features = ["wayland-tablet-unstable-v2"] }
+# Pen position, pressure, tilt, barrel buttons and eraser on Linux and BSDs
+# from Wayland's tablet-v2 protocol and X11's XInput2, the versions winit
+# already uses.
+wayland-backend = { version = "0.3", default-features = false, features = ["client_system", "dlopen"] }
+wayland-client = { version = "0.31", default-features = false, features = ["system", "dlopen"] }
+wayland-cursor = { version = "0.31", default-features = false }
+wayland-protocols = { version = "0.32", default-features = false, features = ["client"] }
+x11rb = { version = "0.13", default-features = false, features = ["xinput"] }
 # Pen pressure from WinTab tablet drivers on Windows; its HWND type.
 wintab = "0.1.1"
 windows = { version = "0.62", default-features = false, features = ["Win32_Foundation"] }

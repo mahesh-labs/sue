@@ -87,6 +87,7 @@ pub fn simplified_points(points: &[[f32; 2]], tolerance: f32) -> Vec<[f32; 2]> {
         .map(|at| Sample {
             at: *at,
             pressure: 1.0,
+            tilt: [0.0, 0.0],
             speed: 0.0,
             width: 1.0,
             alpha: 1.0,
@@ -765,6 +766,7 @@ mod tests {
                 samples.push(Sample {
                     at: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
                     pressure: 1.0,
+                    tilt: [0.0, 0.0],
                     speed: 0.0,
                     width: 1.0,
                     alpha: 1.0,
@@ -775,6 +777,7 @@ mod tests {
         samples.push(Sample {
             at: last,
             pressure: 1.0,
+            tilt: [0.0, 0.0],
             speed: 0.0,
             width: 1.0,
             alpha: 1.0,

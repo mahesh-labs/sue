@@ -1,0 +1,30 @@
+[package]
+name = "sue-wayland"
+description = "Sue on Wayland: the audited foreign-display connection that shares winit's wl_display and wl_surface id with sue-platform."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+wayland-backend.workspace = true
+wayland-client.workspace = true
+winit.workspace = true
+
+# Borrowing winit's live `wl_display` and `wl_surface` pointers is unsafe in
+# Rust: this crate (part of sue-platform, backbone rule 6) relaxes the
+# workspace's `forbid` to `deny` so that audited items may allow it. Approved
+# by the human on 2026-11-05 for `WindowConnection::open` (wrapping winit's
+# Wayland display pointer into a dedicated event queue and reading the window
+# surface's Wayland protocol id); any other unsafe code here needs its own
+# approval.
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

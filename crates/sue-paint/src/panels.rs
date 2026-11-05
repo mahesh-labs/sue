@@ -450,7 +450,7 @@ fn dynamic_row(
         egui::Popup::from_toggle_button_response(&button)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                ui.set_width(300.0);
+                ui.set_width(316.0);
                 dynamics_ui(ui, label, dynamics, theme);
                 extra(ui);
             });
@@ -626,6 +626,12 @@ fn dynamics_ui(ui: &mut Ui, label: &str, dynamics: &mut Dynamics, theme: &Theme)
     );
     input(
         ui,
+        &tr!("pen-tilt"),
+        &mut dynamics.tilt,
+        &mut dynamics.tilt_min,
+    );
+    input(
+        ui,
         &tr!("velocity"),
         &mut dynamics.velocity,
         &mut dynamics.velocity_min,
@@ -647,6 +653,24 @@ fn dynamics_ui(ui: &mut Ui, label: &str, dynamics: &mut Dynamics, theme: &Theme)
                     &mut dynamics.pressure_curve,
                     92.0,
                     sue_wm::widgets::CurveLabels::pressure(),
+                    theme,
+                );
+            });
+        });
+        ui.vertical(|ui| {
+            ui.label(small(&tr!("pen-tilt-settings")));
+            ui.add_enabled_ui(dynamics.tilt, |ui| {
+                sue_wm::widgets::response_curve(
+                    ui,
+                    (label, "tilt"),
+                    &mut dynamics.tilt_curve,
+                    92.0,
+                    sue_wm::widgets::CurveLabels {
+                        input: tr!("pen-tilt"),
+                        low: tr!("upright"),
+                        high: tr!("tilted"),
+                        output: tr!("output"),
+                    },
                     theme,
                 );
             });
@@ -1800,6 +1824,7 @@ impl SuePaint {
                     ui.checkbox(&mut tip.ribbon, small(&tr!("lay-as-a-ribbon")))
                         .on_hover_text(tr!("the-shape-bends-along-the-whole-stroke"));
                     ui.checkbox(&mut tip.follow, small(&tr!("turn-along-the-line")));
+                    ui.checkbox(&mut tip.follow_tilt, small(&tr!("turn-with-pen-tilt")));
                     slider_row(
                         ui,
                         &tr!("angle-2"),

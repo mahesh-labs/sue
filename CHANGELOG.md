@@ -11,8 +11,21 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Pen tilt** in Sue Paint: Brush Size and Opacity dynamics can follow how
+  far the pen leans along a curve you shape, flat and calligraphic tips can
+  turn with the pen's tilt direction (**Turn with pen tilt** in Brush Tip),
+  and flipping the stylus to its eraser end switches to the Eraser for that
+  stroke.
+
 ### Fixed
 
+- Pen tablets and pen displays on Linux (such as the Huion Kamvas 22 Plus,
+  Wacom and XP-Pen) now move the cursor, click, use barrel buttons and carry
+  full pressure and tilt on both Wayland (`tablet-v2` v1 and v2, including
+  KDE Plasma 6) and X11 (`XInput2`), without freezing input on compositors
+  that speak `tablet-v2` version 2.
 - Pen tablets and pen displays on Linux (Wayland), such as Huion, Wacom
   and XP-Pen, now paint with pressure in Sue Paint; before, the
   compositor showed the pen to Sue as a plain mouse.

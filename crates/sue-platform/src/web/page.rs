@@ -560,10 +560,19 @@ pub(crate) fn connect(waker: impl Fn() + 'static, let_through: impl Fn(bool) + '
             if pointer.pointer_type() != "pen" {
                 return;
             }
-            let touching = !lifts && pointer.buttons() & 1 != 0;
-            crate::stylus::set(
+            let buttons = pointer.buttons();
+            let eraser = !lifts && buttons & 32 != 0;
+            let touching = !lifts && buttons & (1 | 32) != 0;
+            let tilt = if lifts {
+                [0.0, 0.0]
+            } else {
+                [pointer.tilt_x() as f32, pointer.tilt_y() as f32]
+            };
+            crate::stylus::set_state(
                 crate::stylus::PenSource::Browser,
                 touching.then(|| pointer.pressure()),
+                tilt,
+                eraser,
             );
         });
     }

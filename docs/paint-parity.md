@@ -402,6 +402,7 @@ The order of work is the plan at the end.
 | Double-sided brush tips | Advanced Tool Settings | missing | |
 | Pen Pressure Settings | File > Pen Pressure Settings | done | Draw to fit your hand, Stronger and Lighter |
 | Windows Ink and WinTab tablets | Peripherals | done | Huion, XP-Pen and Wacom work either way |
+| Linux Wayland (`tablet-v2`) and X11 (`XInput2`) tablets, pen tilt and eraser end | Peripherals, Tool Settings | done | Huion, XP-Pen and Wacom move, click, erase and report pressure and tilt; Brush Size, Opacity and Brush Tip direction follow pen tilt |
 
 ## Text
 
