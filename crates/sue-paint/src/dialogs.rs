@@ -1059,8 +1059,8 @@ pub(crate) enum Dialog {
     Timeline(u32, u32),
     /// New 3D Layer: which of Sue Paint's shapes.
     Shape3D(usize),
-    /// Register Workspace: its name.
-    Workspace(String),
+    /// Register Workspace: its name and whether to also set it as default.
+    Workspace(String, bool),
     /// Manage Workspaces.
     Workspaces,
     /// A page to read: its title and paragraphs.
@@ -1241,8 +1241,8 @@ impl SuePaint {
             Dialog::Webtoon(..) => (tr!("export-webtoon"), vec2(340.0, 170.0)),
             Dialog::Timeline(..) => (tr!("edit-timeline"), vec2(320.0, 150.0)),
             Dialog::Shape3D(_) => (tr!("new-3d-layer"), vec2(300.0, 230.0)),
-            Dialog::Workspace(_) => (tr!("register-workspace"), vec2(340.0, 140.0)),
-            Dialog::Workspaces => (tr!("manage-workspaces"), vec2(380.0, 320.0)),
+            Dialog::Workspace(..) => (tr!("register-workspace"), vec2(360.0, 170.0)),
+            Dialog::Workspaces => (tr!("manage-workspaces"), vec2(480.0, 340.0)),
             Dialog::Message(title, _) => (title.clone(), vec2(520.0, 460.0)),
             Dialog::Print(_, true) => (tr!("print"), vec2(380.0, 330.0)),
             Dialog::Print(_, false) => (tr!("print-settings"), vec2(380.0, 330.0)),
@@ -1342,24 +1342,49 @@ impl SuePaint {
                             });
                             ok_cancel(ui, &mut outcome);
                         }
-                        Dialog::Workspace(name) => {
+                        Dialog::Workspace(name, as_default) => {
                             ui.horizontal(|ui| {
                                 label(ui, &tr!("name"), theme);
                                 ui.text_edit_singleline(name);
                             });
+                            ui.checkbox(as_default, tr!("use-as-default-workspace"));
                             ok_cancel(ui, &mut outcome);
                         }
                         Dialog::Workspaces => {
                             let mut chosen = None;
+                            let mut updated = None;
+                            let mut make_default = None;
                             let mut gone = None;
+                            let mut reset_def = false;
+                            let default_name = self
+                                .default_workspace
+                                .as_ref()
+                                .map(|space| space.name.clone());
                             egui::ScrollArea::vertical()
                                 .max_height(220.0)
                                 .show(ui, |ui| {
                                     for (index, space) in self.workspaces.iter_mut().enumerate() {
                                         ui.horizontal(|ui| {
-                                            ui.text_edit_singleline(&mut space.name);
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut space.name)
+                                                    .desired_width(140.0),
+                                            );
                                             if ui.button(tr!("use")).clicked() {
                                                 chosen = Some(index);
+                                            }
+                                            if ui.button(tr!("update")).clicked() {
+                                                updated = Some(index);
+                                            }
+                                            let is_def = default_name.as_deref()
+                                                == Some(space.name.as_str());
+                                            if ui
+                                                .add_enabled(
+                                                    !is_def,
+                                                    egui::Button::new(tr!("set-default")),
+                                                )
+                                                .clicked()
+                                            {
+                                                make_default = Some(index);
                                             }
                                             if ui.button(tr!("delete")).clicked() {
                                                 gone = Some(index);
@@ -1379,12 +1404,44 @@ impl SuePaint {
                             if let Some(index) = chosen {
                                 self.use_workspace(index);
                             }
+                            if let Some(index) = updated
+                                && let Some(existing) = self.workspaces.get(index)
+                            {
+                                let name = existing.name.clone();
+                                self.workspaces[index] = self.workspace_now(&name);
+                                self.active_workspace = Some(index);
+                                self.save_extras(cx);
+                                self.save_current_workspace(cx);
+                            }
+                            if let Some(index) = make_default
+                                && let Some(space) = self.workspaces.get(index).cloned()
+                            {
+                                self.use_workspace(index);
+                                self.default_workspace = Some(space);
+                                self.set_current_workspace_as_default(cx);
+                            }
                             if let Some(index) = gone {
                                 self.workspaces.remove(index);
+                                if self.active_workspace == Some(index) {
+                                    self.active_workspace = None;
+                                } else if let Some(active) = self.active_workspace
+                                    && active > index
+                                {
+                                    self.active_workspace = Some(active - 1);
+                                }
                             }
                             ui.add_space(8.0);
-                            if ui.button(tr!("close")).clicked() {
-                                outcome = Outcome::Ok;
+                            ui.horizontal(|ui| {
+                                if ui.button(tr!("reset-workspace-to-default")).clicked() {
+                                    reset_def = true;
+                                }
+                                if ui.button(tr!("close")).clicked() {
+                                    outcome = Outcome::Ok;
+                                }
+                            });
+                            if reset_def {
+                                self.reset_workspace_to_default(cx, false);
+                                cx.notify(tr!("workspace-reset-to-default"));
                             }
                         }
                         Dialog::Print(settings, printing) => {
@@ -2151,18 +2208,30 @@ impl SuePaint {
                 }
             }
             (Dialog::Gamut(tolerance, all), Outcome::Ok) => self.select_gamut(cx, tolerance, all),
-            (Dialog::Workspace(name), Outcome::Ok) => {
+            (Dialog::Workspace(name, as_default), Outcome::Ok) => {
                 let name = if name.trim().is_empty() {
                     tr!("workspace")
                 } else {
                     name.trim().to_owned()
                 };
                 let space = self.workspace_now(&name);
-                match self.workspaces.iter().position(|known| known.name == name) {
-                    Some(index) => self.workspaces[index] = space,
-                    None => self.workspaces.push(space),
-                }
+                let index = match self.workspaces.iter().position(|known| known.name == name) {
+                    Some(index) => {
+                        self.workspaces[index] = space;
+                        index
+                    }
+                    None => {
+                        self.workspaces.push(space);
+                        self.workspaces.len() - 1
+                    }
+                };
+                self.active_workspace = Some(index);
                 self.save_extras(cx);
+                if as_default {
+                    self.set_current_workspace_as_default(cx);
+                } else {
+                    self.save_current_workspace(cx);
+                }
             }
             (Dialog::Workspaces, _) => self.save_extras(cx),
             (Dialog::Message(..) | Dialog::Print(..) | Dialog::Modifiers(_), Outcome::Cancel) => {}
@@ -2355,11 +2424,13 @@ impl SuePaint {
                     }
                     Ok(None) => {
                         if !name.trim().is_empty() {
-                            Self::apply(
-                                cx,
-                                crate::doc::Edit::new(tr!("rename-layer"))
-                                    .then(sue_core::txn::Rename::new(layer, name.trim())),
+                            let edit = crate::anim::rename_layer_or_folder(
+                                &cx.world.arena,
+                                self.picture(),
+                                layer,
+                                name.trim(),
                             );
+                            Self::apply(cx, edit);
                         }
                     }
                     Err(error) => cx.fail(error),
@@ -2493,7 +2564,7 @@ impl SuePaint {
                 | Dialog::Webtoon(..)
                 | Dialog::Timeline(..)
                 | Dialog::Shape3D(_)
-                | Dialog::Workspace(_),
+                | Dialog::Workspace(..),
                 Outcome::Cancel,
             ) => {}
         }

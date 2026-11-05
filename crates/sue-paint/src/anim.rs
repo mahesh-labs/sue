@@ -21,6 +21,8 @@ use crate::composite::{FrameView, Skin};
 
 /// The kind of track that is an animation folder.
 pub const CELS: &str = "sue.paint.cels";
+/// The layer folder in the picture that holds a `CELS` track's cels (`Entity`).
+pub const FOLDER: &str = "anim.folder";
 /// A picture's timeline length in frames (`Int`).
 pub const LENGTH: &str = "anim.length";
 /// A key that shows nothing (a clip property).
@@ -388,6 +390,29 @@ pub fn folders(sequence: &Sequence) -> Vec<usize> {
         .collect()
 }
 
+/// The layer folder linked to `track`, if it carries one.
+#[must_use]
+pub fn track_folder(track: &Track) -> Option<EntityId> {
+    track.properties.get(FOLDER).and_then(Value::as_entity)
+}
+
+/// The layer folder in `picture` linked to `track`, when it still exists.
+#[must_use]
+pub fn folder_in(arena: &Arena, picture: EntityId, track: &Track) -> Option<EntityId> {
+    let folder = track_folder(track)?;
+    (crate::doc::is_folder(arena, folder)
+        && arena.relations().parent(folder, sue_core::CHILD) == Some(picture))
+    .then_some(folder)
+}
+
+/// The track index in `sequence` linked to layer `folder`, if any.
+#[must_use]
+pub fn track_of_folder(sequence: &Sequence, folder: EntityId) -> Option<usize> {
+    folders(sequence)
+        .into_iter()
+        .find(|&index| track_folder(&sequence.tracks[index]) == Some(folder))
+}
+
 /// A track's keys: their frames and cels (`None` for a blank key).
 #[must_use]
 pub fn keys(track: &Track, rate: Rate) -> Vec<(u32, Option<EntityId>)> {
@@ -467,6 +492,36 @@ pub fn view(sequence: &Sequence, frame: u32, onion: Option<&Onion>) -> FrameView
     }
 }
 
+/// [`view`] for `picture` in `arena`, also hiding any unassigned cel layer
+/// sitting inside an animation folder's layer folder.
+#[must_use]
+pub fn view_in(
+    arena: &Arena,
+    picture: EntityId,
+    sequence: &Sequence,
+    frame: u32,
+    onion: Option<&Onion>,
+) -> FrameView {
+    let mut out = view(sequence, frame, onion);
+    for index in folders(sequence) {
+        let track = &sequence.tracks[index];
+        let Some(folder) = folder_in(arena, picture, track) else {
+            continue;
+        };
+        let now = (!track.muted)
+            .then(|| cel_at(track, sequence.rate, frame))
+            .flatten();
+        for member in crate::doc::members(arena, picture, folder) {
+            let active = Some(member) == now
+                || now.is_some_and(|cel| crate::doc::folders_around(arena, member).contains(&cel));
+            if !active {
+                out.hidden.insert(member);
+            }
+        }
+    }
+    out
+}
+
 /// A track with its keys' lengths running to the next key (the last to
 /// the timeline's end), as the shared model expects of clips.
 fn tidy(track: &Track, rate: Rate, length: u32) -> Track {
@@ -511,6 +566,8 @@ pub fn assign(
     let rate = out.rate;
     let start = Time::from_frames(i64::from(frame), rate);
     let mut kept = Track::new(old.name.clone(), old.kind.clone());
+    kept.muted = old.muted;
+    kept.locked = old.locked;
     kept.properties = old.properties.clone();
     for clip in old.clips().iter().filter(|clip| clip.start != start) {
         kept.insert(clip.clone());
@@ -538,6 +595,8 @@ pub fn unassign(sequence: &Sequence, track: usize, frame: u32, length: u32) -> S
     let rate = out.rate;
     let start = Time::from_frames(i64::from(frame), rate);
     let mut kept = Track::new(old.name.clone(), old.kind.clone());
+    kept.muted = old.muted;
+    kept.locked = old.locked;
     kept.properties = old.properties.clone();
     for clip in old.clips().iter().filter(|clip| clip.start != start) {
         kept.insert(clip.clone());
@@ -555,6 +614,8 @@ pub fn shift(sequence: &Sequence, frame: u32, by: i64, length: u32) -> Sequence 
     for index in folders(sequence) {
         let old = &sequence.tracks[index];
         let mut moved = Track::new(old.name.clone(), old.kind.clone());
+        moved.muted = old.muted;
+        moved.locked = old.locked;
         moved.properties = old.properties.clone();
         for clip in old.clips() {
             let at = clip.start.frame(rate);
@@ -740,12 +801,100 @@ pub fn mix(arena: &Arena, sequence: &Sequence) -> Option<sue_core::PCMFloat1D> {
     sue_core::PCMFloat1D::new(MIX_RATE, 2, out).ok()
 }
 
+/// `sequence` with a new animation folder named `name`, optionally linked to
+/// layer `folder` in the Layer palette.
+#[must_use]
+pub fn with_linked_folder(sequence: &Sequence, name: &str, folder: Option<EntityId>) -> Sequence {
+    let mut out = sequence.clone();
+    let mut track = Track::new(name, CELS);
+    if let Some(folder) = folder {
+        track.properties.set(FOLDER, folder);
+    }
+    out.tracks.push(track);
+    out
+}
+
 /// `sequence` with a new animation folder named `name`.
 #[must_use]
 pub fn with_folder(sequence: &Sequence, name: &str) -> Sequence {
-    let mut out = sequence.clone();
-    out.tracks.push(Track::new(name, CELS));
-    out
+    with_linked_folder(sequence, name, None)
+}
+
+/// Where a new animation folder's layer folder should sit in `picture`:
+/// `(below, outer_folder)`. When `active` is inside an existing animation
+/// folder, the new folder sits right above that animation folder instead of
+/// nesting inside it as a cel.
+fn placement_for_anim_folder(
+    arena: &Arena,
+    sequence: Option<&Sequence>,
+    active: Option<EntityId>,
+) -> (Option<EntityId>, Option<EntityId>) {
+    let Some(layer) = active else {
+        return (None, None);
+    };
+    if sequence
+        .and_then(|seq| track_of_folder(seq, layer))
+        .is_some()
+    {
+        return (Some(layer), crate::doc::folder_of(arena, layer));
+    }
+    let ancestors = crate::doc::folders_around(arena, layer);
+    if let Some(anim_folder) = ancestors.iter().rev().copied().find(|folder| {
+        sequence
+            .and_then(|seq| track_of_folder(seq, *folder))
+            .is_some()
+    }) {
+        return (Some(anim_folder), crate::doc::folder_of(arena, anim_folder));
+    }
+    (Some(layer), crate::doc::folder_of(arena, layer))
+}
+
+fn next_animation_folder_name(arena: &Arena, picture: EntityId, sequence: &Sequence) -> String {
+    let existing_layers = crate::doc::layers(arena, picture);
+    let mut number = folders(sequence).len() + 1;
+    loop {
+        let candidate = if number == 1 {
+            tr!("animation-folder-1")
+        } else {
+            tr!("animation-folder", value = number)
+        };
+        let taken = folders(sequence)
+            .iter()
+            .any(|&idx| sequence.tracks[idx].name == candidate)
+            || existing_layers.iter().any(|info| info.name == candidate);
+        if !taken {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
+fn next_cel_name(arena: &Arena, picture: EntityId, track: &Track, rate: Rate) -> String {
+    let key_cels: Vec<EntityId> = keys(track, rate)
+        .into_iter()
+        .filter_map(|(_, cel)| cel)
+        .collect();
+    let folder_members = folder_in(arena, picture, track)
+        .map(|folder| {
+            crate::doc::layers(arena, picture)
+                .into_iter()
+                .filter(|info| crate::doc::folder_of(arena, info.id) == Some(folder))
+                .map(|info| info.id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut number = key_cels.len().max(folder_members.len()) + 1;
+    loop {
+        let candidate = number.to_string();
+        let taken = key_cels
+            .iter()
+            .chain(folder_members.iter())
+            .any(|id| arena.get_by_id(*id).is_ok_and(|e| e.name() == candidate));
+        if !taken {
+            return candidate;
+        }
+        number += 1;
+    }
 }
 
 /// The edit that gives `picture` a timeline of `length` frames at `fps`
@@ -753,12 +902,263 @@ pub fn with_folder(sequence: &Sequence, name: &str) -> Sequence {
 #[must_use]
 pub fn new_timeline(picture: EntityId, fps: u32, length: u32) -> Edit {
     let sequence = with_folder(
-        &Sequence::new(Rate::new(fps.max(1), 1), 48_000),
+        &Sequence::new(Rate::new(fps.max(1), 1), MIX_RATE),
         &tr!("animation-folder-1"),
     );
     Edit::new(tr!("new-timeline"))
         .then(SetExtension::set(picture, sequence))
         .then(SetProperty::new(picture, LENGTH, i64::from(length.max(1))))
+}
+
+/// The edit that gives `picture` a timeline of `length` frames at `fps`
+/// together with its `Animation Folder 1` layer folder in `arena`, returning
+/// `(edit, folder_id)`.
+#[must_use]
+pub fn new_timeline_in(
+    arena: &Arena,
+    picture: EntityId,
+    active: Option<EntityId>,
+    fps: u32,
+    length: u32,
+) -> (Edit, EntityId) {
+    let empty = Sequence::new(Rate::new(fps.max(1), 1), MIX_RATE);
+    let name = next_animation_folder_name(arena, picture, &empty);
+    let (below, outer) = placement_for_anim_folder(arena, None, active);
+    let (edit, folder_id) =
+        crate::doc::new_named_folder(arena, picture, below, outer, &name, tr!("new-timeline"));
+    let sequence = with_linked_folder(&empty, &name, Some(folder_id));
+    let edit = edit
+        .then(SetExtension::set(picture, sequence))
+        .then(SetProperty::new(picture, LENGTH, i64::from(length.max(1))));
+    (edit, folder_id)
+}
+
+/// The edit that wraps `first_cel` in `Animation Folder 1` (renamed `"1"`)
+/// and starts a timeline of `length` frames at `fps` showing `"1"` from frame
+/// 0 (used by `File > New > Animation`).
+#[must_use]
+pub fn new_timeline_wrapping_cel(
+    arena: &Arena,
+    picture: EntityId,
+    first_cel: EntityId,
+    fps: u32,
+    length: u32,
+) -> (Edit, EntityId) {
+    let length = length.max(1);
+    let empty = Sequence::new(Rate::new(fps.max(1), 1), MIX_RATE);
+    let name = next_animation_folder_name(arena, picture, &empty);
+    let outer = crate::doc::folder_of(arena, first_cel);
+    let (folder_edit, folder_id) = crate::doc::new_named_folder(
+        arena,
+        picture,
+        Some(first_cel),
+        outer,
+        &name,
+        tr!("new-timeline"),
+    );
+    let mut edit = folder_edit;
+    if let Some(outer) = outer {
+        edit = edit.then(sue_core::txn::Unrelate::new(
+            outer,
+            crate::doc::MEMBER,
+            first_cel,
+        ));
+    }
+    let mut sequence = with_linked_folder(&empty, &name, Some(folder_id));
+    sequence = assign(&sequence, 0, 0, Some(first_cel), picture, length);
+    edit = edit
+        .then(sue_core::txn::Relate::new(sue_core::Relation::new(
+            folder_id,
+            crate::doc::MEMBER,
+            first_cel,
+        )))
+        .then(sue_core::txn::Rename::new(first_cel, "1"))
+        .then(SetExtension::set(picture, sequence))
+        .then(SetProperty::new(picture, LENGTH, i64::from(length)));
+    (edit, folder_id)
+}
+
+/// The edit that adds a new animation folder to `picture`'s `sequence` AND a
+/// matching layer folder in the Layer palette, returning `(edit, folder_id,
+/// track_index)`.
+#[must_use]
+pub fn new_animation_folder(
+    arena: &Arena,
+    picture: EntityId,
+    sequence: &Sequence,
+    active: Option<EntityId>,
+) -> (Edit, EntityId, usize) {
+    let name = next_animation_folder_name(arena, picture, sequence);
+    let (below, outer) = placement_for_anim_folder(arena, Some(sequence), active);
+    let (edit, folder_id) = crate::doc::new_named_folder(
+        arena,
+        picture,
+        below,
+        outer,
+        &name,
+        tr!("new-animation-folder"),
+    );
+    let updated = with_linked_folder(sequence, &name, Some(folder_id));
+    let track = updated.tracks.len() - 1;
+    (
+        edit.then(SetExtension::set(picture, updated)),
+        folder_id,
+        track,
+    )
+}
+
+/// The edit that adds a new animation cel to `picture` at `frame` on
+/// `track_hint` (starting a 24 fps, 24-frame timeline with `Animation Folder
+/// 1` first when `picture` has none yet) and places the cel inside the
+/// animation folder's layer folder in the Layer palette.
+///
+/// # Errors
+/// If `picture` has no canvas size.
+pub fn new_cel_in(
+    arena: &Arena,
+    picture: EntityId,
+    active: Option<EntityId>,
+    track_hint: usize,
+    frame: u32,
+) -> Result<(Edit, EntityId, usize), String> {
+    if let Some(sequence) = timeline(arena, picture) {
+        let length = length(arena, picture);
+        let all_folders = folders(sequence);
+        if let Some(&track) = all_folders
+            .iter()
+            .find(|&&idx| idx == track_hint)
+            .or_else(|| all_folders.first())
+        {
+            let name = next_cel_name(arena, picture, &sequence.tracks[track], sequence.rate);
+            let (edit, cel) = match folder_in(arena, picture, &sequence.tracks[track]) {
+                Some(folder_id) => crate::doc::add_raster_layer_in_folder(
+                    arena, picture, folder_id, active, name, None,
+                )?,
+                None => {
+                    let (spawn, cel) =
+                        crate::doc::add_raster_layer(arena, picture, active, name, None)?;
+                    (Edit::new(tr!("new-animation-cel")).then(spawn), cel)
+                }
+            };
+            let updated = assign(sequence, track, frame, Some(cel), picture, length);
+            return Ok((edit.then(SetExtension::set(picture, updated)), cel, track));
+        }
+        // The timeline had all its animation folder tracks deleted: make a
+        // fresh folder + cel together.
+        let folder_name = next_animation_folder_name(arena, picture, sequence);
+        let (below, outer) = placement_for_anim_folder(arena, Some(sequence), active);
+        let (cel_spawn, cel) =
+            crate::doc::add_raster_layer(arena, picture, below, "1".to_owned(), None)?;
+        let stack = crate::doc::layers(arena, picture);
+        let cel_order = crate::doc::key_above(arena, picture, below);
+        let high = below
+            .and_then(|id| stack.iter().position(|info| info.id == id))
+            .and_then(|idx| stack.get(idx + 1))
+            .map(|info| &info.order);
+        let folder_order = match high {
+            Some(next) if *next > cel_order => {
+                sue_core::OrderKey::between(Some(&cel_order), Some(next))
+            }
+            _ => sue_core::OrderKey::between(Some(&cel_order), None),
+        };
+        let folder_entity = sue_core::Entity::empty(&folder_name, sue_model::class::FOLDER)
+            .with_property(crate::doc::OPEN, true);
+        let folder_id = folder_entity.id();
+        let mut updated = with_linked_folder(sequence, &folder_name, Some(folder_id));
+        let track = updated.tracks.len() - 1;
+        updated = assign(&updated, track, frame, Some(cel), picture, length);
+        let mut edit = Edit::new(tr!("new-animation-cel"))
+            .then(cel_spawn)
+            .then(
+                sue_core::txn::SpawnEntity::new(folder_entity).with_relation(
+                    sue_core::Relation::new(picture, sue_core::CHILD, folder_id)
+                        .ordered(folder_order),
+                ),
+            )
+            .then(sue_core::txn::Relate::new(sue_core::Relation::new(
+                folder_id,
+                crate::doc::MEMBER,
+                cel,
+            )));
+        if let Some(outer) = outer {
+            edit = edit.then(sue_core::txn::Relate::new(sue_core::Relation::new(
+                outer,
+                crate::doc::MEMBER,
+                folder_id,
+            )));
+        }
+        edit = edit.then(SetExtension::set(picture, updated));
+        return Ok((edit, cel, track));
+    }
+
+    // No timeline yet: start a 24 fps, 24-frame timeline with Animation
+    // Folder 1 and cel "1" inside it as one undo step.
+    let empty = Sequence::new(Rate::new(24, 1), MIX_RATE);
+    let folder_name = next_animation_folder_name(arena, picture, &empty);
+    let (below, outer) = placement_for_anim_folder(arena, None, active);
+    let (cel_spawn, cel) =
+        crate::doc::add_raster_layer(arena, picture, below, "1".to_owned(), None)?;
+    let stack = crate::doc::layers(arena, picture);
+    let cel_order = crate::doc::key_above(arena, picture, below);
+    let high = below
+        .and_then(|id| stack.iter().position(|info| info.id == id))
+        .and_then(|idx| stack.get(idx + 1))
+        .map(|info| &info.order);
+    let folder_order = match high {
+        Some(next) if *next > cel_order => {
+            sue_core::OrderKey::between(Some(&cel_order), Some(next))
+        }
+        _ => sue_core::OrderKey::between(Some(&cel_order), None),
+    };
+    let folder_entity = sue_core::Entity::empty(&folder_name, sue_model::class::FOLDER)
+        .with_property(crate::doc::OPEN, true);
+    let folder_id = folder_entity.id();
+    let mut sequence = with_linked_folder(&empty, &folder_name, Some(folder_id));
+    sequence = assign(&sequence, 0, frame.min(23), Some(cel), picture, 24);
+    let mut edit = Edit::new(tr!("new-animation-cel"))
+        .then(cel_spawn)
+        .then(
+            sue_core::txn::SpawnEntity::new(folder_entity).with_relation(
+                sue_core::Relation::new(picture, sue_core::CHILD, folder_id).ordered(folder_order),
+            ),
+        )
+        .then(sue_core::txn::Relate::new(sue_core::Relation::new(
+            folder_id,
+            crate::doc::MEMBER,
+            cel,
+        )));
+    if let Some(outer) = outer {
+        edit = edit.then(sue_core::txn::Relate::new(sue_core::Relation::new(
+            outer,
+            crate::doc::MEMBER,
+            folder_id,
+        )));
+    }
+    let edit = edit
+        .then(SetExtension::set(picture, sequence))
+        .then(SetProperty::new(picture, LENGTH, 24_i64));
+    Ok((edit, cel, 0))
+}
+
+/// Renames `layer` to `name`, also updating its linked animation folder track
+/// on `picture`'s timeline when `layer` is one.
+#[must_use]
+pub fn rename_layer_or_folder(
+    arena: &Arena,
+    picture: Option<EntityId>,
+    layer: EntityId,
+    name: &str,
+) -> Edit {
+    let mut edit = Edit::new(tr!("rename-layer")).then(sue_core::txn::Rename::new(layer, name));
+    if let Some(picture) = picture
+        && let Some(sequence) = timeline(arena, picture)
+        && let Some(track) = track_of_folder(sequence, layer)
+    {
+        let mut updated = sequence.clone();
+        updated.tracks[track].name = name.to_owned();
+        edit = edit.then(SetExtension::set(picture, updated));
+    }
+    edit
 }
 
 /// The edit that brings `frames` (a movie's) into `picture` as cels of a
@@ -797,22 +1197,28 @@ pub fn import_frames(
         })
         .collect();
     let count = cels.len() as u32;
-    let (spawns, ids) = crate::doc::add_layers_pixels(arena, picture, below, cels)?;
-    let (sequence, length) = match timeline(arena, picture) {
+    let existing = timeline(arena, picture);
+    let (place_below, outer) = placement_for_anim_folder(arena, existing, below);
+    let (edit, folder_id, ids) = crate::doc::add_layers_pixels_in_folder(
+        arena,
+        picture,
+        place_below,
+        outer,
+        name,
+        tr!("import-movie", name = name),
+        cels,
+    )?;
+    let (sequence, length) = match existing {
         Some(sequence) => (sequence.clone(), length(arena, picture).max(count)),
         None => (
             Sequence::new(Rate::new(fps.round().clamp(1.0, 120.0) as u32, 1), MIX_RATE),
             count,
         ),
     };
-    let mut sequence = with_folder(&sequence, name);
+    let mut sequence = with_linked_folder(&sequence, name, Some(folder_id));
     let track = sequence.tracks.len() - 1;
     for (frame, cel) in ids.iter().enumerate() {
         sequence = assign(&sequence, track, frame as u32, Some(*cel), picture, length);
-    }
-    let mut edit = Edit::new(tr!("import-movie", name = name));
-    for spawn in spawns {
-        edit = edit.then(spawn);
     }
     let edit = edit
         .then(SetExtension::set(picture, sequence))
@@ -885,6 +1291,19 @@ pub fn from_sheet_csv(
     blank_source: EntityId,
     cel: impl Fn(&str) -> Option<EntityId>,
 ) -> (Sequence, u32) {
+    from_sheet_csv_for_tracks(sequence, length, text, blank_source, |_, name| cel(name))
+}
+
+/// Like [`from_sheet_csv`], passing each column's track index to `cel` so two
+/// animation folders can each have their own cel named `"1"`.
+#[must_use]
+pub fn from_sheet_csv_for_tracks(
+    sequence: &Sequence,
+    length: u32,
+    text: &str,
+    blank_source: EntityId,
+    cel: impl Fn(usize, &str) -> Option<EntityId>,
+) -> (Sequence, u32) {
     let rows: Vec<Vec<String>> = text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -914,7 +1333,7 @@ pub fn from_sheet_csv(
             let shown = if value.eq_ignore_ascii_case("x") {
                 None
             } else {
-                match cel(value) {
+                match cel(track, value) {
                     Some(found) => Some(found),
                     None => continue,
                 }
@@ -1294,5 +1713,95 @@ mod tests {
             .arena(&sue_model::registry())
             .unwrap();
         assert_eq!(timeline(&loaded, id), Some(&sequence));
+    }
+
+    #[test]
+    fn animation_folders_create_layer_folders_and_keep_their_cels_inside() {
+        let mut arena = Arena::new();
+        let mut history: sue_core::UndoStack<Arena> = sue_core::UndoStack::new();
+        let (edit, picture) = crate::doc::create(&crate::doc::NewPicture {
+            name: "Bounce".to_owned(),
+            width: 16,
+            height: 16,
+            ..crate::doc::NewPicture::default()
+        })
+        .unwrap();
+        history.apply(&mut arena, edit).unwrap();
+        let base_layer = crate::doc::layers(&arena, picture).last().unwrap().id;
+
+        // Start a timeline: Animation Folder 1 appears in both Timeline and
+        // Layer stack.
+        let (edit, folder_1) = new_timeline_in(&arena, picture, Some(base_layer), 24, 24);
+        history.apply(&mut arena, edit).unwrap();
+        assert!(crate::doc::is_folder(&arena, folder_1));
+        assert_eq!(
+            track_of_folder(timeline(&arena, picture).unwrap(), folder_1),
+            Some(0)
+        );
+
+        // Add two cels to Animation Folder 1: both sit inside `folder_1`,
+        // below its header in `layers()`.
+        let (edit, cel_1a, track_a) = new_cel_in(&arena, picture, Some(folder_1), 0, 0).unwrap();
+        history.apply(&mut arena, edit).unwrap();
+        assert_eq!(track_a, 0);
+        assert_eq!(crate::doc::folder_of(&arena, cel_1a), Some(folder_1));
+
+        let (edit, cel_1b, _) = new_cel_in(&arena, picture, Some(cel_1a), 0, 3).unwrap();
+        history.apply(&mut arena, edit).unwrap();
+        assert_eq!(crate::doc::folder_of(&arena, cel_1b), Some(folder_1));
+
+        let stack_ids: Vec<EntityId> = crate::doc::layers(&arena, picture)
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        let pos = |id: EntityId| stack_ids.iter().position(|&item| item == id).unwrap();
+        assert!(pos(base_layer) < pos(cel_1a));
+        assert!(pos(cel_1a) < pos(cel_1b));
+        assert!(pos(cel_1b) < pos(folder_1));
+
+        // Create a second animation folder while `cel_1b` is active: it sits
+        // above `folder_1`, not inside it, and cels added to it belong to
+        // `folder_2`.
+        let seq = timeline(&arena, picture).unwrap().clone();
+        let (edit, folder_2, track_2) = new_animation_folder(&arena, picture, &seq, Some(cel_1b));
+        history.apply(&mut arena, edit).unwrap();
+        assert_eq!(track_2, 1);
+        assert_eq!(crate::doc::folder_of(&arena, folder_2), None);
+
+        let (edit, cel_2a, _) = new_cel_in(&arena, picture, Some(folder_2), track_2, 0).unwrap();
+        history.apply(&mut arena, edit).unwrap();
+        assert_eq!(crate::doc::folder_of(&arena, cel_2a), Some(folder_2));
+        assert_eq!(
+            arena.get_by_id(cel_2a).unwrap().name(),
+            "1",
+            "each animation folder numbers its own cels from 1"
+        );
+
+        // Unassigned cels inside an animation folder stay hidden in `view_in`.
+        let unkeyed = unassign(timeline(&arena, picture).unwrap(), 0, 3, 24);
+        history
+            .apply(&mut arena, set(picture, unkeyed, "Unassign"))
+            .unwrap();
+        let shown_0 = view_in(&arena, picture, timeline(&arena, picture).unwrap(), 4, None);
+        assert!(
+            shown_0.hidden.contains(&cel_1b),
+            "unassigned member cel stays hidden"
+        );
+        assert!(!shown_0.hidden.contains(&cel_1a));
+
+        // Renaming the layer folder renames its timeline track as well, and
+        // undo restores both.
+        let rename = rename_layer_or_folder(&arena, Some(picture), folder_2, "Lineart");
+        history.apply(&mut arena, rename).unwrap();
+        assert_eq!(arena.get_by_id(folder_2).unwrap().name(), "Lineart");
+        assert_eq!(
+            timeline(&arena, picture).unwrap().tracks[track_2].name,
+            "Lineart"
+        );
+        history.undo(&mut arena).unwrap();
+        assert_ne!(
+            timeline(&arena, picture).unwrap().tracks[track_2].name,
+            "Lineart"
+        );
     }
 }

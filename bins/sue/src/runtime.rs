@@ -2746,6 +2746,48 @@ pub(crate) mod tests {
             keys.iter().map(|(frame, _)| *frame).collect::<Vec<_>>(),
             vec![0, 3]
         );
+        let first_folder =
+            sue_paint::anim::folder_in(arena, picture, &sequence.tracks[0]).expect("layer folder");
+        for (_, cel) in &keys {
+            assert_eq!(
+                sue_paint::doc::folder_of(arena, cel.unwrap()),
+                Some(first_folder),
+                "animation cels sit inside their animation folder's layer folder"
+            );
+        }
+
+        // New animation folder from the Timeline creates a linked layer folder
+        // in the Layer palette and puts its cels inside that layer folder.
+        let folder_depth = runtime.engine.history.depth();
+        command(&mut runtime, "anim.layer.folder");
+        assert_eq!(runtime.engine.history.depth(), folder_depth + 1);
+        command(&mut runtime, "anim.cel.new");
+        assert_eq!(runtime.engine.history.depth(), folder_depth + 2);
+        {
+            let arena = &runtime.engine.world.arena;
+            let sequence = sue_paint::anim::timeline(arena, picture).expect("a timeline");
+            assert_eq!(sue_paint::anim::folders(sequence).len(), 2);
+            let second_folder = sue_paint::anim::folder_in(arena, picture, &sequence.tracks[1])
+                .expect("second animation folder's layer folder");
+            assert_ne!(second_folder, first_folder);
+            assert!(sue_paint::doc::is_folder(arena, second_folder));
+            let second_cel =
+                sue_paint::anim::cel_at(&sequence.tracks[1], sequence.rate, 3).expect("cel in 2");
+            assert_eq!(
+                sue_paint::doc::folder_of(arena, second_cel),
+                Some(second_folder)
+            );
+        }
+        // Undo both steps back to the single-folder state so the rest of the test runs unchanged.
+        step(
+            &mut runtime,
+            vec![key(egui::Key::Z, egui::Modifiers::COMMAND)],
+        );
+        step(
+            &mut runtime,
+            vec![key(egui::Key::Z, egui::Modifiers::COMMAND)],
+        );
+        assert_eq!(runtime.engine.history.depth(), folder_depth);
 
         // Onion skin and undo.
         command(&mut runtime, "anim.onion");
@@ -3899,7 +3941,8 @@ pub(crate) mod tests {
         step(&mut runtime, Vec::new());
         // The reference layer on the general light table.
         let cel = sue_paint::doc::layers(&runtime.engine.world.arena, picture)
-            .last()
+            .into_iter()
+            .rfind(|info| info.kind == sue_model::picture::LayerKind::Raster)
             .unwrap()
             .id;
         assert_ne!(cel, reference);
@@ -8187,6 +8230,156 @@ f 2 3 4
             start,
         );
         assert!(runtime.shell.message().is_none_or(|(_, error)| !error));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sue_paint_panels_resize_move_save_as_default_workspace_and_reset() {
+        let (host, root) = temp_host("paint-workspaces");
+        let mut runtime = Runtime::new(Engine::boot(&host).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let size = vec2(1440.0, 900.0);
+        let start = Instant::now();
+        let mut now = start;
+        let paint = AppletId::new(sue_paint::ID).unwrap();
+
+        runtime.request(ShellRequest::Open(paint.clone()), &mut NoTextures, now);
+        frames(&mut runtime, &ctx, size, now, |_| Vec::new());
+        let mut step = |runtime: &mut Runtime, events: Vec<egui::Event>| {
+            frame_with(runtime, &ctx, now, events);
+            now += Duration::from_millis(8);
+        };
+        // Open a canvas so the full desktop workspace renders.
+        step(
+            &mut runtime,
+            vec![key(egui::Key::N, egui::Modifiers::COMMAND)],
+        );
+        step(
+            &mut runtime,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        step(&mut runtime, Vec::new());
+
+        // Drag the Tools column's right edge (around x = 46) wider to 96 px so
+        // it becomes a multi-column tool strip.
+        let page = runtime.shell.page_rect();
+        let edge_from = Pos2::new(page.left() + 46.0, page.center().y);
+        let edge_to = Pos2::new(page.left() + 96.0, page.center().y);
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        step(&mut runtime, vec![egui::Event::PointerMoved(edge_from)]);
+        step(&mut runtime, vec![press(edge_from, true)]);
+        step(&mut runtime, vec![egui::Event::PointerMoved(edge_to)]);
+        step(&mut runtime, vec![press(edge_to, false)]);
+
+        // Hide the navigator, register a workspace (checked "Use as default" by
+        // default), and confirm with Enter.
+        runtime.request(
+            ShellRequest::AppletCommand {
+                applet: paint.clone(),
+                command: "window.navigator".to_owned(),
+            },
+            &mut NoTextures,
+            start,
+        );
+        runtime.request(
+            ShellRequest::AppletCommand {
+                applet: paint.clone(),
+                command: "window.workspace.save".to_owned(),
+            },
+            &mut NoTextures,
+            start,
+        );
+        step(&mut runtime, Vec::new());
+        step(
+            &mut runtime,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        step(&mut runtime, Vec::new());
+
+        let paint_dir = runtime.engine.catalog.folders["paint"].clone();
+        let saved_current = std::fs::read_to_string(paint_dir.join("current_workspace.txt"))
+            .expect("current workspace written");
+        let saved_default = std::fs::read_to_string(paint_dir.join("default_workspace.txt"))
+            .expect("default workspace written");
+        assert!(
+            saved_current.contains("left 96 tools=1"),
+            "resized Tools column width persisted: {saved_current}"
+        );
+        assert_eq!(saved_current, saved_default);
+
+        // Reboot a brand-new Runtime against the same host directory and verify
+        // desktop startup keeps the saved workspace rather than overwriting it.
+        let mut reopened = Runtime::new(Engine::boot(&host).unwrap()).unwrap();
+        let ctx2 = egui::Context::default();
+        reopened.request(ShellRequest::Open(paint.clone()), &mut NoTextures, now);
+        frames(&mut reopened, &ctx2, size, now, |_| Vec::new());
+        frame_with(
+            &mut reopened,
+            &ctx2,
+            now,
+            vec![key(egui::Key::N, egui::Modifiers::COMMAND)],
+        );
+        now += Duration::from_millis(8);
+        frame_with(
+            &mut reopened,
+            &ctx2,
+            now,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        now += Duration::from_millis(8);
+        frame_with(&mut reopened, &ctx2, now, Vec::new());
+        now += Duration::from_millis(8);
+
+        // Turn Navigator back on, then run `window.workspace.reset_default`:
+        // first reset restores the user's saved default workspace (Navigator off
+        // and Tools width 96), and a second reset restores factory layout!
+        reopened.request(
+            ShellRequest::AppletCommand {
+                applet: paint.clone(),
+                command: "window.navigator".to_owned(),
+            },
+            &mut NoTextures,
+            now,
+        );
+        frame_with(&mut reopened, &ctx2, now, Vec::new());
+        now += Duration::from_millis(8);
+        reopened.request(
+            ShellRequest::AppletCommand {
+                applet: paint.clone(),
+                command: "window.workspace.reset_default".to_owned(),
+            },
+            &mut NoTextures,
+            now,
+        );
+        frame_with(&mut reopened, &ctx2, now, Vec::new());
+        now += Duration::from_millis(8);
+        let after_first_reset =
+            std::fs::read_to_string(paint_dir.join("current_workspace.txt")).unwrap();
+        assert!(
+            after_first_reset.contains("left 96 tools=1"),
+            "first reset_default restores user's saved default workspace: {after_first_reset}"
+        );
+
+        reopened.request(
+            ShellRequest::AppletCommand {
+                applet: paint,
+                command: "window.workspace.reset_default".to_owned(),
+            },
+            &mut NoTextures,
+            now,
+        );
+        frame_with(&mut reopened, &ctx2, now, Vec::new());
+        let after_factory_reset =
+            std::fs::read_to_string(paint_dir.join("current_workspace.txt")).unwrap();
+        assert!(
+            after_factory_reset.contains("left 46 tools=1"),
+            "second reset_default restores factory layout: {after_factory_reset}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

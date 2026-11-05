@@ -64,6 +64,15 @@ pub fn set_workspaces(menus: &mut [Menu], names: &[String]) {
         &tr!("manage-workspaces-ellipsis"),
         "window.workspace.manage",
     ));
+    items.push(SEP);
+    items.push(act(
+        &tr!("use-current-workspace-as-default"),
+        "window.workspace.set_default",
+    ));
+    items.push(act(
+        &tr!("reset-workspace-to-default"),
+        "window.workspace.reset_default",
+    ));
     for menu in menus.iter_mut().filter(|menu| menu.title == tr!("window")) {
         for item in &mut menu.items {
             if let MenuItem::Sub {
@@ -819,6 +828,15 @@ pub fn menus() -> Vec<Menu> {
                         act(
                             &tr!("manage-workspaces-ellipsis"),
                             "window.workspace.manage",
+                        ),
+                        SEP,
+                        act(
+                            &tr!("use-current-workspace-as-default"),
+                            "window.workspace.set_default",
+                        ),
+                        act(
+                            &tr!("reset-workspace-to-default"),
+                            "window.workspace.reset_default",
                         ),
                     ],
                 ),

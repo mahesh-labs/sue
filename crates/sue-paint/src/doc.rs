@@ -641,6 +641,29 @@ pub fn new_folder(
     (edit, id)
 }
 
+/// The edit that makes a folder named `name` right above `below` (or on top),
+/// inside `outer` when given, and the folder's id.
+#[must_use]
+pub fn new_named_folder(
+    arena: &Arena,
+    picture: EntityId,
+    below: Option<EntityId>,
+    outer: Option<EntityId>,
+    name: impl Into<String>,
+    label: impl Into<String>,
+) -> (Edit, EntityId) {
+    let folder = Entity::empty(name, class::FOLDER).with_property(OPEN, true);
+    let id = folder.id();
+    let order = key_above(arena, picture, below);
+    let mut edit = Edit::new(label).then(
+        SpawnEntity::new(folder).with_relation(Relation::new(picture, CHILD, id).ordered(order)),
+    );
+    if let Some(outer) = outer {
+        edit = edit.then(Relate::new(Relation::new(outer, MEMBER, id)));
+    }
+    (edit, id)
+}
+
 /// The edit that puts `layer` in `folder` (`None`: in no folder).
 #[must_use]
 pub fn set_folder(arena: &Arena, layer: EntityId, folder: Option<EntityId>) -> Option<Edit> {
@@ -708,7 +731,7 @@ pub fn new_layer_name(arena: &Arena, picture: EntityId) -> String {
 }
 
 /// The order key for a new layer right above `below` (or at the top).
-fn key_above(arena: &Arena, picture: EntityId, below: Option<EntityId>) -> OrderKey {
+pub(crate) fn key_above(arena: &Arena, picture: EntityId, below: Option<EntityId>) -> OrderKey {
     let stack = layers(arena, picture);
     let Some(index) = below.and_then(|id| stack.iter().position(|layer| layer.id == id)) else {
         return arena.relations().next_order(picture, CHILD);
@@ -717,6 +740,39 @@ fn key_above(arena: &Arena, picture: EntityId, below: Option<EntityId>) -> Order
     match stack.get(index + 1) {
         Some(next) if next.order > *low => OrderKey::between(Some(low), Some(&next.order)),
         _ => OrderKey::between(Some(low), None),
+    }
+}
+
+/// The order key for a new member of `folder`: right above `below` when
+/// `below` is already inside `folder` below its header, otherwise at the top
+/// of `folder`'s members (just below `folder` in `stack`).
+pub(crate) fn key_in_folder(
+    arena: &Arena,
+    picture: EntityId,
+    folder: EntityId,
+    below: Option<EntityId>,
+) -> OrderKey {
+    let stack = layers(arena, picture);
+    let Some(f_idx) = stack.iter().position(|layer| layer.id == folder) else {
+        return key_above(arena, picture, below);
+    };
+    if let Some(b_idx) = below
+        .filter(|id| folder_of(arena, *id) == Some(folder))
+        .and_then(|id| stack.iter().position(|layer| layer.id == id))
+        .filter(|&idx| idx < f_idx)
+    {
+        let low = &stack[b_idx].order;
+        let high = &stack[b_idx + 1].order;
+        if low < high {
+            return OrderKey::between(Some(low), Some(high));
+        }
+    }
+    let prev = f_idx.checked_sub(1).map(|idx| &stack[idx].order);
+    let high = &stack[f_idx].order;
+    if prev.is_none_or(|low| low < high) {
+        OrderKey::between(prev, Some(high))
+    } else {
+        high.clone()
     }
 }
 
@@ -759,6 +815,41 @@ pub fn add_raster_layer(
         SpawnEntity::new(layer).with_relation(Relation::new(picture, CHILD, id).ordered(order)),
         id,
     ))
+}
+
+/// A new raster layer inside `folder` (above `below` when `below` is already
+/// in `folder`, else at the top of `folder`).
+///
+/// # Errors
+/// If the picture has no size.
+pub fn add_raster_layer_in_folder(
+    arena: &Arena,
+    picture: EntityId,
+    folder: EntityId,
+    below: Option<EntityId>,
+    name: String,
+    fill: Option<[u8; 4]>,
+) -> Result<(Edit, EntityId), String> {
+    let [width, height] = size_of(arena, picture)?;
+    let raster = match fill {
+        Some(rgba) => RasterTile2D::from_bytes(
+            width,
+            height,
+            PixelFormat::Rgba8,
+            rgba.repeat(width as usize * height as usize),
+        ),
+        None => RasterTile2D::new(width, height, PixelFormat::Rgba8),
+    }
+    .map_err(|error| error.to_string())?;
+    let layer = Entity::new(name, raster).with_class(class::LAYER);
+    let id = layer.id();
+    let order = key_in_folder(arena, picture, folder, below);
+    let edit = Edit::new(tr!("new-animation-cel"))
+        .then(
+            SpawnEntity::new(layer).with_relation(Relation::new(picture, CHILD, id).ordered(order)),
+        )
+        .then(Relate::new(Relation::new(folder, MEMBER, id)));
+    Ok((edit, id))
 }
 
 /// A new raster layer named `name` right above `below` (or at the top),
@@ -860,6 +951,69 @@ pub fn add_layers_pixels(
         low = Some(order);
     }
     Ok((spawns, ids))
+}
+
+/// New raster layers inside a newly spawned folder named `folder_name`,
+/// placed right above `below` (or on top) and inside `outer` when given;
+/// returns `(edit, folder_id, cel_ids)`.
+///
+/// # Errors
+/// If a raster is not the picture's size.
+pub fn add_layers_pixels_in_folder(
+    arena: &Arena,
+    picture: EntityId,
+    below: Option<EntityId>,
+    outer: Option<EntityId>,
+    folder_name: &str,
+    label: impl Into<String>,
+    layers_in: Vec<(String, RasterTile2D)>,
+) -> Result<(Edit, EntityId, Vec<EntityId>), String> {
+    let [width, height] = size_of(arena, picture)?;
+    let stack = layers(arena, picture);
+    let at = below.and_then(|id| stack.iter().position(|layer| layer.id == id));
+    let mut low = match at {
+        Some(index) => Some(stack[index].order.clone()),
+        None => stack.last().map(|layer| layer.order.clone()),
+    };
+    let high = at
+        .and_then(|index| stack.get(index + 1))
+        .map(|layer| layer.order.clone());
+    let mut next_order = || {
+        let order = match (&low, &high) {
+            (Some(low), Some(high)) if high > low => OrderKey::between(Some(low), Some(high)),
+            (low, _) => OrderKey::between(low.as_ref(), None),
+        };
+        low = Some(order.clone());
+        order
+    };
+    let mut edit = Edit::new(label);
+    let mut ids = Vec::with_capacity(layers_in.len());
+    for (name, raster) in layers_in {
+        if raster.width() != width || raster.height() != height {
+            return Err(tr!("layer-not-pictures-size"));
+        }
+        let order = next_order();
+        let layer = Entity::new(name, raster).with_class(class::LAYER);
+        let id = layer.id();
+        edit = edit.then(
+            SpawnEntity::new(layer).with_relation(Relation::new(picture, CHILD, id).ordered(order)),
+        );
+        ids.push(id);
+    }
+    let folder = Entity::empty(folder_name, class::FOLDER).with_property(OPEN, true);
+    let folder_id = folder.id();
+    let folder_order = next_order();
+    edit = edit.then(
+        SpawnEntity::new(folder)
+            .with_relation(Relation::new(picture, CHILD, folder_id).ordered(folder_order)),
+    );
+    if let Some(outer) = outer {
+        edit = edit.then(Relate::new(Relation::new(outer, MEMBER, folder_id)));
+    }
+    for &id in &ids {
+        edit = edit.then(Relate::new(Relation::new(folder_id, MEMBER, id)));
+    }
+    Ok((edit, folder_id, ids))
 }
 
 /// A layer the fill and auto select can refer to (Set as Reference Layer,

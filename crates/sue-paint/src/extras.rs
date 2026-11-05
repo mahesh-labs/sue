@@ -316,6 +316,28 @@ impl SuePaint {
                     .collect()
             })
             .unwrap_or_default();
+        self.default_workspace = read(folder.as_deref(), "default_workspace.txt")
+            .and_then(|text| sections(&text).into_iter().next())
+            .map(|(name, lines)| Workspace { name, lines });
+        if let Some((active_name, lines)) = read(folder.as_deref(), "current_workspace.txt")
+            .and_then(|text| sections(&text).into_iter().next())
+        {
+            let current = Workspace {
+                name: active_name.clone(),
+                lines,
+            };
+            self.apply_workspace(&current);
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .position(|space| space.name == active_name);
+        } else if let Some(def) = self.default_workspace.clone() {
+            self.apply_workspace(&def);
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .position(|space| space.name == def.name);
+        }
         self.refresh_workspace_menu();
     }
 
@@ -377,20 +399,23 @@ impl SuePaint {
 
     /// The current palette layout as a workspace named `name`.
     pub(crate) fn workspace_now(&self, name: &str) -> Workspace {
+        let panels = self.hidden_panels.as_ref().unwrap_or(&self.panels);
         let mut lines = self.dock.to_lines();
-        lines.push(panels_line(&self.panels));
+        lines.push(panels_line(panels));
         lines.push(tr!("menus", value = u8::from(!self.menus_hidden)));
+        lines.push(format!(
+            "tabs {} {} {} {} {}",
+            self.tool_tab, self.color_tab, self.set_tab, self.nav_tab, self.layer_tab
+        ));
         Workspace {
             name: name.to_owned(),
             lines,
         }
     }
 
-    /// Lays the palettes out as workspace `index` says.
-    pub(crate) fn use_workspace(&mut self, index: usize) {
-        let Some(space) = self.workspaces.get(index).cloned() else {
-            return;
-        };
+    /// Applies `space`'s dock, panel flags, menu visibility, and tab selection.
+    pub(crate) fn apply_workspace(&mut self, space: &Workspace) {
+        self.hidden_panels = None;
         if let Some(dock) = crate::dock::Dock::from_lines(&space.lines) {
             self.dock = dock;
         }
@@ -401,7 +426,102 @@ impl SuePaint {
             if let Some(shown) = line.strip_prefix("menus ") {
                 self.menus_hidden = shown == "0";
             }
+            if let Some(tabs) = line.strip_prefix("tabs ") {
+                let nums: Vec<u8> = tabs
+                    .split_whitespace()
+                    .filter_map(|part| part.parse::<u8>().ok())
+                    .collect();
+                if nums.len() == 5 {
+                    self.tool_tab = nums[0];
+                    self.color_tab = nums[1];
+                    self.set_tab = nums[2];
+                    self.nav_tab = nums[3];
+                    self.layer_tab = nums[4];
+                }
+            }
         }
+    }
+
+    /// Lays the palettes out as workspace `index` says.
+    pub(crate) fn use_workspace(&mut self, index: usize) {
+        let Some(space) = self.workspaces.get(index).cloned() else {
+            return;
+        };
+        self.apply_workspace(&space);
+        self.active_workspace = Some(index);
+        self.layout_dirty = true;
+    }
+
+    /// Persists the live workspace layout to `current_workspace.txt` so
+    /// restarting Sue Paint resumes the user's current panel arrangement.
+    pub(crate) fn save_current_workspace(&mut self, cx: &mut AppletContext<'_>) {
+        let Some(folder) = crate::colorsets::folder(cx) else {
+            return;
+        };
+        let label = self
+            .active_workspace
+            .and_then(|index| self.workspaces.get(index))
+            .map_or("Current", |space| space.name.as_str())
+            .to_owned();
+        let current = self.workspace_now(&label);
+        let text = write_sections(std::iter::once((current.name.as_str(), current.lines)));
+        let _ = write(Some(folder.as_path()), "current_workspace.txt", &text);
+    }
+
+    /// Saves the current panel arrangement as the user's default workspace.
+    pub(crate) fn set_current_workspace_as_default(&mut self, cx: &mut AppletContext<'_>) {
+        let label = self
+            .active_workspace
+            .and_then(|index| self.workspaces.get(index))
+            .map_or("Default", |space| space.name.as_str())
+            .to_owned();
+        let space = self.workspace_now(&label);
+        self.default_workspace = Some(space.clone());
+        let folder = crate::colorsets::folder(cx);
+        let text = write_sections(std::iter::once((space.name.as_str(), space.lines)));
+        if let Some(dir) = folder.as_deref()
+            && let Err(error) = write(Some(dir), "default_workspace.txt", &text)
+        {
+            cx.fail(tr!("cannot-keep-the-palettes-settings", error = error));
+            return;
+        }
+        self.save_current_workspace(cx);
+        cx.notify(tr!("default-workspace-saved"));
+    }
+
+    /// Resets the workspace to the default layout. When `factory` is `false`
+    /// and a custom default workspace is saved (and differs from the current
+    /// layout), restores that custom default; otherwise restores Sue Paint's
+    /// built-in factory default layout.
+    pub(crate) fn reset_workspace_to_default(&mut self, cx: &mut AppletContext<'_>, factory: bool) {
+        if !factory
+            && let Some(def) = self.default_workspace.clone()
+            && self.workspace_now(&def.name).lines != def.lines
+        {
+            self.apply_workspace(&def);
+            self.active_workspace = self
+                .workspaces
+                .iter()
+                .position(|space| space.name == def.name);
+            self.save_current_workspace(cx);
+            return;
+        }
+        self.dock = crate::dock::Dock::default();
+        self.panels = Panels::default();
+        self.hidden_panels = None;
+        self.menus_hidden = false;
+        self.tool_tab = 0;
+        self.color_tab = 0;
+        self.set_tab = 0;
+        self.nav_tab = 0;
+        self.layer_tab = 0;
+        self.active_workspace = None;
+        if self.default_workspace.take().is_some()
+            && let Some(folder) = crate::colorsets::folder(cx)
+        {
+            let _ = sue_platform::fs::remove_file(folder.join("default_workspace.txt"));
+        }
+        self.save_current_workspace(cx);
     }
 
     /// Plays auto action `index`: each of its commands in turn.
@@ -689,5 +809,42 @@ mod tests {
             ..Panels::default()
         };
         assert_eq!(panels_from(&panels_line(&panels)), Some(panels));
+    }
+
+    #[test]
+    fn workspaces_round_trip_custom_dock_sizes_tabs_and_default_reset() {
+        use crate::dock::{Palette, Side};
+        let mut paint = SuePaint::default();
+        // Resize the Tools and BrushSize columns, float ToolProperty and History,
+        // dock CommandBar at the bottom, and switch active tabs.
+        paint.dock.left[0].width = 82.0;
+        paint.dock.left[2].width = 132.0;
+        paint.dock.dock_new_row(Palette::CommandBar, false, 0);
+        paint.dock.float_rect(
+            Palette::ToolProperty,
+            Rect::from_min_size(pos2(360.0, 120.0), egui::vec2(310.0, 420.0)),
+        );
+        paint.dock.dock_new_column(Palette::History, Side::Right, 0);
+        paint.panels.navigator = false;
+        paint.color_tab = 2;
+        paint.layer_tab = 1;
+
+        let saved = paint.workspace_now("Animator");
+        let mut fresh = SuePaint::default();
+        fresh.apply_workspace(&saved);
+        assert_eq!(fresh.dock, paint.dock);
+        assert_eq!(fresh.panels, paint.panels);
+        assert_eq!(fresh.color_tab, 2);
+        assert_eq!(fresh.layer_tab, 1);
+
+        // Save as default workspace, modify layout, and verify reset restores
+        // the custom default first, then factory default when already at it.
+        fresh.default_workspace = Some(saved.clone());
+        fresh.dock.left[0].width = 140.0;
+        fresh.panels.layer = false;
+        assert_ne!(fresh.workspace_now("Animator").lines, saved.lines);
+        fresh.apply_workspace(&saved);
+        assert_eq!(fresh.dock.left[0].width, 82.0);
+        assert!(fresh.panels.layer);
     }
 }

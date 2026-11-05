@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use egui::{Key, Modifiers, Pos2, Rect, Ui, pos2, vec2};
+use egui::{Key, Modifiers, Pos2, Rect, Ui, vec2};
 use sue_core::txn::{Batch, SetProperty, SpawnEntity};
 use sue_core::{
     Arena, CHILD, ComponentKind, Entity, EntityId, PixelFormat, Properties, RasterTile2D, Relation,
@@ -408,6 +408,14 @@ pub struct SuePaint {
     pub(crate) item_bank: Vec<crate::extras::Item>,
     /// The registered workspaces.
     pub(crate) workspaces: Vec<crate::extras::Workspace>,
+    /// The workspace saved as the user's default (`default_workspace.txt`).
+    pub(crate) default_workspace: Option<crate::extras::Workspace>,
+    /// Index into `workspaces` of the active registered workspace, if any.
+    pub(crate) active_workspace: Option<usize>,
+    /// Panel flags remembered while `Hide All Palettes` (`Tab`) is active.
+    pub(crate) hidden_panels: Option<Panels>,
+    /// `true` when panel arrangement changed and should write `current_workspace.txt`.
+    pub(crate) layout_dirty: bool,
     /// Canvas presets registered in the New dialog.
     pub(crate) canvas_presets: Vec<crate::dialogs::CanvasPreset>,
     /// Every open canvas shows at once, side by side (Window, Canvas,
@@ -515,6 +523,12 @@ pub struct SuePaint {
     /// How wide a frame is on the timeline, once zoomed; `None` fits
     /// the timeline to the palette.
     pub(crate) timeline_step: Option<f32>,
+    /// The first frame the timeline shows (scrolled by wheel, drag or bar).
+    pub(crate) timeline_first: f32,
+    /// The frame the timeline last followed, so a pan is not undone.
+    pub(crate) timeline_seen: Option<u32>,
+    /// How far the timeline's tracks are scrolled up, in points.
+    pub(crate) timeline_down: f32,
     /// A 3D layer's view being changed in Tool Property, and its view and
     /// pixels from before.
     pub(crate) view3d_before: Option<(EntityId, crate::three::View3D, Vec<u8>)>,
@@ -674,6 +688,10 @@ impl Default for SuePaint {
             auto: crate::extras::AutoActions::default(),
             item_bank: Vec::new(),
             workspaces: Vec::new(),
+            default_workspace: None,
+            active_workspace: None,
+            hidden_panels: None,
+            layout_dirty: false,
             tiled: false,
             print: crate::print::PrintSettings::default(),
             bar_hidden: HashSet::new(),
@@ -723,6 +741,9 @@ impl Default for SuePaint {
             audio_lap: None,
             audio_drag: None,
             timeline_step: None,
+            timeline_first: 0.0,
+            timeline_seen: None,
+            timeline_down: 0.0,
             camera_pending: None,
             view3d_before: None,
             pending_view3d: None,
@@ -1207,6 +1228,8 @@ fn implemented(command: &str) -> bool {
             | "window.cascade"
             | "window.workspace.save"
             | "window.workspace.manage"
+            | "window.workspace.set_default"
+            | "window.workspace.reset_default"
             | "window.sub_view"
             | "window.cels"
             | "window.auto_actions"
@@ -4374,26 +4397,61 @@ impl SuePaint {
             "window.command_bar" => flag(self.panels.command_bar),
             "window.tool" => flag(self.panels.tool),
             "window.sub_tool" => flag(self.panels.sub_tool),
-            "window.tool_property" => flag(self.panels.tool_property),
+            "window.tool_property" => flag(
+                self.panels.tool_property
+                    || self.dock.is_open_panel(crate::dock::Palette::ToolProperty),
+            ),
             "window.brush_size" => flag(self.panels.brush_size),
             "window.color_wheel" => flag(self.panels.color && self.color_tab == 0),
-            "window.color_slider" => flag(self.panels.color && self.color_tab == 1),
-            "window.intermediate" => flag(self.panels.color && self.color_tab == 2),
-            "window.approximate" => flag(self.panels.color && self.color_tab == 3),
+            "window.color_slider" => flag(
+                (self.panels.color && self.color_tab == 1)
+                    || self.dock.is_open_panel(crate::dock::Palette::ColorSlider),
+            ),
+            "window.intermediate" => flag(
+                (self.panels.color && self.color_tab == 2)
+                    || self.dock.is_open_panel(crate::dock::Palette::Intermediate),
+            ),
+            "window.approximate" => flag(
+                (self.panels.color && self.color_tab == 3)
+                    || self.dock.is_open_panel(crate::dock::Palette::Approximate),
+            ),
             "window.color_set" => flag(self.panels.color_set && self.set_tab == 0),
-            "window.material" => flag(self.panels.color_set && self.set_tab == 2),
-            "window.color_history" => flag(self.panels.color_set && self.set_tab == 1),
+            "window.material" => flag(
+                (self.panels.color_set && self.set_tab == 2)
+                    || self.dock.is_open_panel(crate::dock::Palette::Material),
+            ),
+            "window.color_history" => flag(
+                (self.panels.color_set && self.set_tab == 1)
+                    || self.dock.is_open_panel(crate::dock::Palette::ColorHistory),
+            ),
             "window.navigator" => flag(self.panels.navigator),
-            "window.sub_view" => flag(self.panels.navigator && self.nav_tab == 1),
-            "window.cels" => flag(self.panels.layer && self.layer_tab == 3),
+            "window.sub_view" => flag(
+                (self.panels.navigator && self.nav_tab == 1)
+                    || self.dock.is_open_panel(crate::dock::Palette::SubView),
+            ),
+            "window.cels" => flag(
+                (self.panels.layer && self.layer_tab == 3)
+                    || self.dock.is_open_panel(crate::dock::Palette::Cels),
+            ),
             "window.tile" => flag(self.tiled),
             "view.ruler_bar" => flag(self.ruler_bar),
             "view.scroll_bar" => flag(self.scroll_bars),
             "file.new_clipboard" => when(self.clipboard.is_some()),
-            "window.brush_grid" => flag(self.panels.sub_tool && self.tool_tab == 2),
+            "window.brush_grid" => flag(
+                (self.panels.sub_tool && self.tool_tab == 2)
+                    || self.dock.is_open_panel(crate::dock::Palette::BrushGrid),
+            ),
             "window.info" => flag(self.dock.has(crate::dock::Palette::Info)),
             "window.auto_actions" => flag(self.dock.has(crate::dock::Palette::AutoAction)),
             "window.item_bank" => flag(self.dock.has(crate::dock::Palette::ItemBank)),
+            "window.workspace.set_default" | "window.workspace.reset_default" => ItemState::on(),
+            used if used.starts_with("window.workspace.use.") => {
+                let active = used["window.workspace.use.".len()..]
+                    .parse::<usize>()
+                    .ok()
+                    .is_some_and(|index| self.active_workspace == Some(index));
+                flag(active)
+            }
             interface if interface.starts_with("window.interface.") => {
                 flag(self.interface == interface["window.interface.".len()..])
             }
@@ -4414,8 +4472,14 @@ impl SuePaint {
             "window.cascade" => when(self.tiled),
             "window.new" => when(has_doc),
             "window.layer" => flag(self.panels.layer && self.layer_tab == 0),
-            "window.layer_property" => flag(self.panels.layer && self.layer_tab == 1),
-            "window.history" => flag(self.panels.layer && self.layer_tab == 2),
+            "window.layer_property" => flag(
+                (self.panels.layer && self.layer_tab == 1)
+                    || self.dock.is_open_panel(crate::dock::Palette::LayerProperty),
+            ),
+            "window.history" => flag(
+                (self.panels.layer && self.layer_tab == 2)
+                    || self.dock.is_open_panel(crate::dock::Palette::History),
+            ),
             "window.timeline" => flag(self.panels.timeline),
             "window.hide_all" => flag(!self.any_panel()),
             "window.next_tab" | "window.prev_tab" => when(self.docs.len() > 1),
@@ -5406,7 +5470,15 @@ impl SuePaint {
             "layer.delete" => {
                 if let (Some(picture), Some(layer)) = (self.picture(), self.layer()) {
                     if doc::is_folder(&cx.world.arena, layer) {
-                        let edit = doc::delete_folder(&cx.world.arena, picture, layer);
+                        let mut edit = doc::delete_folder(&cx.world.arena, picture, layer);
+                        if let Some(sequence) = crate::anim::timeline(&cx.world.arena, picture)
+                            && let Some(track) = crate::anim::track_of_folder(sequence, layer)
+                        {
+                            edit = edit.then(sue_core::txn::SetExtension::set(
+                                picture,
+                                crate::anim::without_track(sequence, track),
+                            ));
+                        }
                         Self::apply(cx, edit);
                         return;
                     }
@@ -6353,38 +6425,64 @@ impl SuePaint {
                 };
             }
             "window.hide_all" => {
-                let show = !self.any_panel();
-                let command_bar = self.panels.command_bar;
-                self.panels = Panels {
-                    command_bar,
-                    tool: show,
-                    sub_tool: show,
-                    tool_property: show,
-                    brush_size: show,
-                    color: show,
-                    color_set: show,
-                    navigator: show,
-                    layer: show,
-                    timeline: show,
-                };
+                if let Some(saved) = self.hidden_panels.take() {
+                    self.panels = saved;
+                } else if self.any_panel() {
+                    let saved = self.panels;
+                    self.hidden_panels = Some(saved);
+                    self.panels = Panels {
+                        command_bar: saved.command_bar,
+                        tool: false,
+                        sub_tool: false,
+                        tool_property: false,
+                        brush_size: false,
+                        color: false,
+                        color_set: false,
+                        navigator: false,
+                        layer: false,
+                        timeline: false,
+                    };
+                } else {
+                    self.panels = Panels {
+                        command_bar: self.panels.command_bar,
+                        ..Panels::default()
+                    };
+                }
             }
-            "window.command_bar" => self.panels.command_bar = !self.panels.command_bar,
-            "window.hide_menus" => self.menus_hidden = !self.menus_hidden,
+            "window.command_bar" => {
+                self.panels.command_bar = !self.panels.command_bar;
+                if let Some(saved) = &mut self.hidden_panels {
+                    saved.command_bar = self.panels.command_bar;
+                }
+                self.layout_dirty = true;
+            }
+            "window.hide_menus" => {
+                self.menus_hidden = !self.menus_hidden;
+                self.layout_dirty = true;
+            }
             "window.workspace.save" => {
-                self.dialog = Some(Dialog::Workspace(tr!(
-                    "workspace-2",
-                    value = self.workspaces.len() + 1
-                )))
+                self.dialog = Some(Dialog::Workspace(
+                    tr!("workspace-2", value = self.workspaces.len() + 1),
+                    true,
+                ));
             }
             "window.workspace.manage" => self.dialog = Some(Dialog::Workspaces),
+            "window.workspace.set_default" => self.set_current_workspace_as_default(cx),
+            "window.workspace.reset_default" => {
+                self.reset_workspace_to_default(cx, false);
+                cx.notify(tr!("workspace-reset-to-default"));
+            }
             used if used.starts_with("window.workspace.use.") => {
                 if let Ok(index) = used["window.workspace.use.".len()..].parse::<usize>() {
                     self.use_workspace(index);
+                    self.save_current_workspace(cx);
                 }
             }
             "window.sub_view" => {
+                self.hidden_panels = None;
                 self.panels.navigator = true;
                 self.nav_tab = 1;
+                self.layout_dirty = true;
             }
             // Palettes of their own, opened from the strip.
             "window.info" | "window.auto_actions" | "window.item_bank" => {
@@ -6400,10 +6498,13 @@ impl SuePaint {
                 if self.dock.iconized.contains(&palette) {
                     self.dock.popped = Some(palette);
                 }
+                self.layout_dirty = true;
             }
             "window.cels" => {
+                self.hidden_panels = None;
                 self.panels.layer = true;
                 self.layer_tab = 3;
+                self.layout_dirty = true;
             }
             "window.new" => {
                 if let Some(doc) = self.doc() {
@@ -6420,18 +6521,36 @@ impl SuePaint {
             "window.tile" => self.tiled = true,
             "window.cascade" => self.tiled = false,
             "window.workspace.reset" => {
-                self.dock = crate::dock::Dock::default();
-                self.panels = Panels::default();
-                self.menus_hidden = false;
+                self.reset_workspace_to_default(cx, true);
             }
-            "window.tool" => self.panels.tool = !self.panels.tool,
-            "window.sub_tool" => self.panels.sub_tool = !self.panels.sub_tool,
-            "window.tool_property" => self.panels.tool_property = !self.panels.tool_property,
-            "window.brush_size" => self.panels.brush_size = !self.panels.brush_size,
+            "window.tool" => {
+                self.hidden_panels = None;
+                self.panels.tool = !self.panels.tool;
+                self.layout_dirty = true;
+            }
+            "window.sub_tool" => {
+                self.hidden_panels = None;
+                self.panels.sub_tool = !self.panels.sub_tool;
+                self.layout_dirty = true;
+            }
+            "window.tool_property" => {
+                self.hidden_panels = None;
+                self.panels.tool_property = !self.panels.tool_property;
+                if !self.panels.tool_property {
+                    self.dock.remove(crate::dock::Palette::ToolProperty);
+                }
+                self.layout_dirty = true;
+            }
+            "window.brush_size" => {
+                self.hidden_panels = None;
+                self.panels.brush_size = !self.panels.brush_size;
+                self.layout_dirty = true;
+            }
             "window.color_wheel"
             | "window.color_slider"
             | "window.intermediate"
             | "window.approximate" => {
+                self.hidden_panels = None;
                 let tab = match command {
                     "window.color_slider" => 1,
                     "window.intermediate" => 2,
@@ -6444,8 +6563,10 @@ impl SuePaint {
                     self.panels.color = true;
                     self.color_tab = tab;
                 }
+                self.layout_dirty = true;
             }
             "window.color_set" | "window.color_history" | "window.material" => {
+                self.hidden_panels = None;
                 let tab = match command {
                     "window.color_history" => 1,
                     "window.material" => 2,
@@ -6457,17 +6578,28 @@ impl SuePaint {
                     self.panels.color_set = true;
                     self.set_tab = tab;
                 }
+                self.layout_dirty = true;
             }
-            "window.navigator" => self.panels.navigator = !self.panels.navigator,
+            "window.navigator" => {
+                self.hidden_panels = None;
+                self.panels.navigator = !self.panels.navigator;
+                self.layout_dirty = true;
+            }
             "window.layer" => {
+                self.hidden_panels = None;
                 if self.panels.layer && self.layer_tab == 0 {
                     self.panels.layer = false;
                 } else {
                     self.panels.layer = true;
                     self.layer_tab = 0;
                 }
+                self.layout_dirty = true;
             }
-            "window.timeline" => self.panels.timeline = !self.panels.timeline,
+            "window.timeline" => {
+                self.hidden_panels = None;
+                self.panels.timeline = !self.panels.timeline;
+                self.layout_dirty = true;
+            }
             "help.shortcuts" => self.dialog = Some(Dialog::Shortcuts),
             "help.about" => cx.notify(tr!("sue-paint-layered-painting-inside-sue")),
             _ => {}
@@ -6717,34 +6849,23 @@ impl SuePaint {
             ui.spacing_mut().button_padding = vec2(8.0, 6.0);
         }
 
-        // The menus are in Sue's top bar (`bar_ui`); the command bar sits
-        // at the page's top. While the studio comes in or goes out, every
-        // palette slides in from or out to its edge of the window.
-        let top_height = if self.menus_hidden || !self.panels.command_bar {
-            0.0
-        } else {
-            38.0
-        };
-        let lift = self.hide * top_height;
-        if top_height > 0.0 {
-            let top = full.top() - lift;
-            let strip = Rect::from_min_max(pos2(full.left(), top), pos2(full.right(), top + 38.0));
-            self.command_bar(ui, strip, cx, &theme);
-        }
-        let body = Rect::from_min_max(pos2(full.left(), full.top() + top_height - lift), full.max);
-        self.body(ui, body, cx, &theme);
+        // The menus are in Sue's top bar (`bar_ui`); every palette,
+        // including the command bar and timeline, lives in `dock` so the
+        // user can resize, move, dock or float any panel and keep it as a
+        // workspace.
+        self.body(ui, full, cx, &theme);
         if self.ready {
             self.dialog_ui(&ctx, cx, &theme);
         }
     }
 
-    /// Puts the palettes where `form`'s layout wants them, once, when the
-    /// studio first shows in it or the interface changes: a tablet keeps the
-    /// tool strip and the layers docked and the rest as icons beside the
-    /// canvas, ready to pop out over it.
+    /// Puts the palettes where `form`'s layout wants them when the
+    /// interface switches form factor: a tablet keeps the tool strip and
+    /// the layers docked and the rest as icons beside the canvas, while
+    /// desktop preserves any workspace loaded on startup.
     fn lay_out_for(&mut self, form: sue_platform::FormFactor) {
         use crate::dock::Palette;
-        self.laid_for = Some(form);
+        let was = self.laid_for.replace(form);
         self.sheet = None;
         match form {
             sue_platform::FormFactor::Tablet => {
@@ -6760,30 +6881,22 @@ impl SuePaint {
                 }
             }
             sue_platform::FormFactor::Desktop => {
-                if self.dock.iconized.len() >= 4 {
-                    self.dock = crate::dock::Dock::default();
+                if was == Some(sue_platform::FormFactor::Tablet) {
+                    if let Some(def) = self.default_workspace.clone() {
+                        self.apply_workspace(&def);
+                    } else {
+                        self.dock = crate::dock::Dock::default();
+                    }
                 }
             }
             sue_platform::FormFactor::Mobile => {}
         }
     }
 
-    /// Lays out the palettes around the canvas: docked, collapsed or
-    /// floating (`dock`), the timeline under the canvas, and the canvas.
+    /// Lays out every palette around the canvas (`dock`) and draws the
+    /// canvas in the remaining center area.
     fn body(&mut self, ui: &mut Ui, body: Rect, cx: &mut AppletContext<'_>, theme: &sue_wm::Theme) {
-        let mut center = self.dock_ui(ui, body, cx, theme);
-        let room = center.height() > 360.0 && center.width() > 320.0;
-        if self.panels.timeline && room {
-            let height = self.dock.timeline.min(center.height() - 200.0).max(90.0);
-            let top = center.bottom() - height * (1.0 - self.hide);
-            let timeline =
-                Rect::from_min_max(pos2(center.left(), top), pos2(center.right(), top + height));
-            self.timeline_panel(ui, timeline, cx, theme);
-            if self.ready {
-                self.timeline_splitter(ui, top, center.x_range(), theme);
-            }
-            center.max.y = top;
-        }
+        let center = self.dock_ui(ui, body, cx, theme);
         self.canvas_area(ui, center, cx, theme);
     }
 }

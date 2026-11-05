@@ -4,8 +4,8 @@
 //! timeline.
 
 use egui::{
-    Align2, Color32, Id, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui,
-    UiBuilder, pos2, vec2,
+    Align2, Color32, CursorIcon, Id, Mesh, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind,
+    Ui, UiBuilder, pos2, vec2,
 };
 use sue_core::Value;
 use sue_model::BlendMode;
@@ -70,13 +70,14 @@ pub(crate) fn icon_button(
 }
 
 /// A palette's tab strip, as Clip Studio Paint draws it: each tab an icon
-/// and its name, the chosen one lit. When the names do not all fit, only
-/// the chosen tab keeps its name and the others show their icon (with the
-/// name on hover). Returns the body below it and a clicked tab.
+/// and its name, the chosen one lit, and any tab or empty header space
+/// draggable to move the panel or tear off a companion tab into its own
+/// panel. Returns the body below it and a clicked tab.
 fn header(
+    dock: &mut crate::dock::Dock,
     ui: &mut Ui,
     rect: Rect,
-    tabs: &[(String, Icon, bool)],
+    tabs: &[(String, Icon, bool, crate::dock::Palette)],
     selected: u8,
     theme: &Theme,
 ) -> (Rect, Option<u8>) {
@@ -87,7 +88,7 @@ fn header(
     let icon_side = 18.0;
     let lay_out = |size: f32| -> Vec<_> {
         tabs.iter()
-            .map(|(title, _, _)| {
+            .map(|(title, _, _, _)| {
                 painter.layout_no_wrap(title.clone(), theme.font(size), theme.text)
             })
             .collect()
@@ -103,20 +104,28 @@ fn header(
     let labelled = |galley: &std::sync::Arc<egui::Galley>| icon_side + 6.0 + galley.size().x + 14.0;
     let bare = icon_side + 14.0;
     let all: f32 = galleys.iter().map(labelled).sum::<f32>() + 2.0 * tabs.len() as f32;
-    let names = all <= strip.width() - 8.0;
+    let names = all <= strip.width() - 26.0;
+    let max_tab_right = (strip.right() - 24.0).max(strip.left() + 4.0);
     let mut x = strip.left() + 4.0;
     let mut clicked = None;
-    let painter = painter.with_clip_rect(strip);
-    for ((index, (title, icon, enabled)), galley) in tabs.iter().enumerate().zip(galleys) {
+    let clip_strip = Rect::from_min_max(strip.min, pos2(max_tab_right, strip.bottom()));
+    let painter = painter.with_clip_rect(clip_strip);
+    for ((index, (title, icon, enabled, tab_palette)), galley) in
+        tabs.iter().enumerate().zip(galleys)
+    {
+        if x >= max_tab_right {
+            break;
+        }
         let chosen = index as u8 == selected;
         let named = names || chosen;
-        let width = if named { labelled(&galley) } else { bare };
+        let raw_w = if named { labelled(&galley) } else { bare };
+        let width = raw_w.min((max_tab_right - x).max(16.0));
         let tab = Rect::from_min_size(pos2(x, strip.top() + 2.0), vec2(width, 26.0));
         x = tab.right() + 2.0;
         let response = ui.interact(
             tab,
             Id::unique(("sue-paint-tab", title, rect.min.x as i32, rect.min.y as i32)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
         if chosen {
             painter.rect_filled(tab, theme.control_radius, theme.panel);
@@ -140,7 +149,7 @@ fn header(
             vec2(icon_side, icon_side),
         );
         icons::paint(&painter, icon_rect, *icon, color);
-        if named {
+        if named && tab.width() >= icon_side + 16.0 {
             painter.galley(
                 pos2(
                     icon_rect.right() + 6.0,
@@ -157,6 +166,34 @@ fn header(
         };
         if *enabled && response.clicked() {
             clicked = Some(index as u8);
+        }
+        if response.drag_started()
+            && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        {
+            dock.begin_move_from_header(*tab_palette, pointer, rect);
+        }
+    }
+    if x + 6.0 < max_tab_right
+        && let Some((_, _, _, owner_palette)) = tabs.first()
+    {
+        let empty = Rect::from_min_max(pos2(x, strip.top()), pos2(max_tab_right, strip.bottom()));
+        let response = ui.interact(
+            empty,
+            Id::unique((
+                "sue-paint-hdr-empty",
+                owner_palette.key(),
+                rect.min.x as i32,
+                rect.min.y as i32,
+            )),
+            Sense::drag(),
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if response.drag_started()
+            && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        {
+            dock.begin_move_from_header(*owner_palette, pointer, rect);
         }
     }
     (
@@ -750,24 +787,50 @@ impl SuePaint {
         ui.painter().rect_filled(strip, 0.0, theme.panel);
         ui.painter()
             .hline(strip.x_range(), strip.bottom(), theme.hairline());
+        let grip = Rect::from_min_size(
+            strip.min + vec2(2.0, 4.0),
+            vec2(12.0, 30.0_f32.min(strip.height() - 4.0)),
+        );
+        crate::dock::grip_handle(
+            &mut self.dock,
+            ui,
+            grip,
+            crate::dock::Palette::CommandBar,
+            strip,
+            true,
+            theme,
+        );
+        let start_x = strip.left() + 16.0;
+        let max_x = (strip.right() - 24.0).max(start_x + 34.0);
         let groups = BAR_GROUPS;
-        let mut x = strip.left() + 8.0;
+        let mut x = start_x;
+        let mut y = strip.top() + 3.0;
         let mut clicked: Option<String> = None;
         let mut save_at = None;
         for (index, group) in groups.iter().enumerate() {
-            if index > 0 {
-                ui.painter().vline(
-                    x + 3.0,
-                    strip.shrink2(vec2(0.0, 8.0)).y_range(),
-                    theme.hairline(),
-                );
-                x += 8.0;
+            if index > 0 && x > start_x {
+                if x + 42.0 > max_x && y + 66.0 <= strip.bottom() + 4.0 {
+                    x = start_x;
+                    y += 34.0;
+                } else {
+                    ui.painter()
+                        .vline(x + 3.0, (y + 4.0)..=(y + 28.0), theme.hairline());
+                    x += 8.0;
+                }
             }
             for (icon, command, tip) in group.iter() {
                 if self.bar_hidden.contains(*command) {
                     continue;
                 }
-                let rect = Rect::from_min_size(pos2(x, strip.top() + 3.0), vec2(32.0, 32.0));
+                if x + 32.0 > max_x && x > start_x {
+                    if y + 66.0 <= strip.bottom() + 4.0 {
+                        x = start_x;
+                        y += 34.0;
+                    } else {
+                        break;
+                    }
+                }
+                let rect = Rect::from_min_size(pos2(x, y), vec2(32.0, 32.0));
                 x += 34.0;
                 if *command == "file.save" {
                     save_at = Some(rect);
@@ -794,10 +857,16 @@ impl SuePaint {
                 .trim_end_matches("...")
                 .to_owned();
             let galley = ui.painter().layout_no_wrap(label, font.clone(), theme.text);
-            let rect = Rect::from_min_size(
-                pos2(x + 4.0, strip.top() + 4.0),
-                vec2(galley.size().x + 14.0, 26.0),
-            );
+            let btn_w = galley.size().x + 14.0;
+            if x + 4.0 + btn_w > max_x && x > start_x {
+                if y + 66.0 <= strip.bottom() + 4.0 {
+                    x = start_x;
+                    y += 34.0;
+                } else {
+                    break;
+                }
+            }
+            let rect = Rect::from_min_size(pos2(x + 4.0, y + 1.0), vec2(btn_w, 26.0));
             x = rect.right() + 2.0;
             let state = self.state(command, &cx.world.arena, cx.history);
             let response = ui.interact(
@@ -829,7 +898,7 @@ impl SuePaint {
             return;
         };
         let save = Rect::from_min_size(
-            pos2(save_button.right() - 2.0, strip.top() + 9.0),
+            pos2(save_button.right() - 2.0, save_button.top() + 6.0),
             vec2(10.0, 16.0),
         );
         let response = ui.interact(save, Id::unique("sue-paint-save-menu"), Sense::click());
@@ -874,7 +943,12 @@ impl SuePaint {
     /// Frame border and Balloon as Comic, and Hand, Zoom and Move layer as
     /// Move; clicking one again goes to the next), then the main and sub
     /// colors as overlapping circles with their swap, and the transparent
-    /// color.
+    /// color. Adapts smoothly to single-column, multi-column, and horizontal
+    /// layouts as the user resizes or moves the panel.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "tool strip supports vertical, multi-column and horizontal layouts"
+    )]
     pub(crate) fn tool_strip(
         &mut self,
         ui: &mut Ui,
@@ -886,7 +960,6 @@ impl SuePaint {
         ui.painter().rect_filled(strip, 0.0, theme.panel);
         ui.painter()
             .vline(strip.right(), strip.y_range(), theme.hairline());
-        // (icon, name, tools; none for Downloads), and None between groups.
         let entries: [Option<(Icon, String, &[Tool])>; 23] = [
             Some((Icon::Import, tr!("downloads"), &[])),
             Some((Icon::Pen, tr!("pen"), &[Tool::Pen])),
@@ -917,69 +990,209 @@ impl SuePaint {
             Some((Icon::Eyedropper, tr!("eyedropper"), &[Tool::Eyedropper])),
         ];
         let current = self.toolbox.tool();
-        // Liquify is Blend's liquify sub tools; Blend the others.
         let liquify = current == Tool::Blend && is_liquify_mode(self.toolbox.of(Tool::Blend).mode);
-        let room = strip.height() - 12.0 - 96.0;
-        let buttons = entries.iter().flatten().count() as f32;
-        let gaps = (entries.len() as f32 - buttons) * 8.0;
-        let step = ((room - gaps) / buttons).clamp(20.0, 34.0);
-        let mut y = strip.top() + 6.0;
-        for entry in &entries {
-            let Some((icon, name, tools)) = entry else {
-                ui.painter().hline(
-                    strip.shrink2(vec2(8.0, 0.0)).x_range(),
-                    y + 3.0,
-                    theme.hairline(),
-                );
-                y += 8.0;
-                continue;
-            };
-            if y + step > strip.bottom() - 96.0 {
-                break;
+        let horizontal = strip.width() > strip.height() * 1.3;
+        let pick_entry = |this: &mut Self, icon: Icon, tools: &[Tool]| match tools {
+            [] => {
+                this.start.navigate("start/show");
+                this.start.navigate("start/browse");
             }
-            let rect = Rect::from_min_size(pos2(strip.left() + 4.0, y), vec2(38.0, step - 2.0));
-            y += step;
-            let is_liquify = *icon == Icon::Replace;
-            let active = match tools.first() {
-                Some(Tool::Blend) => liquify == is_liquify && current == Tool::Blend,
-                Some(_) => tools.contains(&current),
-                None => false,
-            };
-            let key = tools.first().and_then(|tool| tool.key());
-            let tip = match key {
-                Some(key) => format!("{name} ({key})"),
-                None => name.clone(),
-            };
-            if !icon_button(ui, rect, *icon, true, active, &tip, theme) {
-                continue;
-            }
-            match tools {
-                // Downloads: Browse Assets on the start page, where
-                // materials download into Sue as transfers.
-                [] => {
-                    self.start.navigate("start/show");
-                    self.start.navigate("start/browse");
+            [Tool::Blend] => {
+                let is_liquify = icon == Icon::Replace;
+                this.toolbox.pick(Tool::Blend);
+                let picked = is_liquify_mode(this.toolbox.of(Tool::Blend).mode);
+                if is_liquify && !picked {
+                    this.toolbox.pick_sub(Tool::Blend, 2);
+                } else if !is_liquify && picked {
+                    this.toolbox.pick_sub(Tool::Blend, 0);
                 }
-                [Tool::Blend] => {
-                    self.toolbox.pick(Tool::Blend);
-                    let picked = is_liquify_mode(self.toolbox.of(Tool::Blend).mode);
-                    if is_liquify && !picked {
-                        self.toolbox.pick_sub(Tool::Blend, 2);
-                    } else if !is_liquify && picked {
-                        self.toolbox.pick_sub(Tool::Blend, 0);
+            }
+            group => {
+                let next = group
+                    .iter()
+                    .position(|tool| *tool == current)
+                    .map_or(group[0], |at| group[(at + 1) % group.len()]);
+                this.toolbox.pick(next);
+            }
+        };
+
+        if horizontal {
+            let grip = Rect::from_min_size(
+                strip.min + vec2(2.0, 4.0),
+                vec2(12.0, (strip.height() - 8.0).max(16.0)),
+            );
+            crate::dock::grip_handle(
+                &mut self.dock,
+                ui,
+                grip,
+                crate::dock::Palette::Tools,
+                strip,
+                true,
+                theme,
+            );
+            let show_colors = strip.width() >= 220.0 && strip.height() >= 68.0;
+            let right_limit = if show_colors {
+                strip.right() - 62.0
+            } else {
+                strip.right() - 26.0
+            };
+            let start_x = strip.left() + 16.0;
+            let mut x = start_x;
+            let mut y = strip.top() + 5.0;
+            for entry in &entries {
+                let Some((icon, name, tools)) = entry else {
+                    if x > start_x && x + 36.0 <= right_limit {
+                        ui.painter()
+                            .vline(x + 3.0, (y + 3.0)..=(y + 27.0), theme.hairline());
+                        x += 8.0;
+                    }
+                    continue;
+                };
+                if x + 32.0 > right_limit && x > start_x {
+                    if y + 64.0 <= strip.bottom() + 4.0 {
+                        x = start_x;
+                        y += 32.0;
+                    } else {
+                        break;
                     }
                 }
-                // A group: the next of its tools when one is already out.
-                group => {
-                    let next = group
-                        .iter()
-                        .position(|tool| *tool == current)
-                        .map_or(group[0], |at| group[(at + 1) % group.len()]);
-                    self.toolbox.pick(next);
+                let rect = Rect::from_min_size(pos2(x, y), vec2(30.0, 30.0));
+                x += 32.0;
+                let is_liquify = *icon == Icon::Replace;
+                let active = match tools.first() {
+                    Some(Tool::Blend) => liquify == is_liquify && current == Tool::Blend,
+                    Some(_) => tools.contains(&current),
+                    None => false,
+                };
+                let tip = match tools.first().and_then(|tool| tool.key()) {
+                    Some(key) => format!("{name} ({key})"),
+                    None => name.clone(),
+                };
+                if icon_button(ui, rect, *icon, true, active, &tip, theme) {
+                    pick_entry(self, *icon, tools);
+                }
+            }
+            if show_colors {
+                self.color_circles(
+                    ui,
+                    pos2(strip.right() - 44.0, strip.center().y - 12.0),
+                    theme,
+                );
+            }
+            return;
+        }
+
+        // Vertical single-column or multi-column layout.
+        let grip = Rect::from_min_size(
+            pos2(strip.left() + 4.0, strip.top() + 2.0),
+            vec2(
+                (strip.width() - 8.0).min((strip.width() - 26.0).max(18.0)),
+                12.0,
+            ),
+        );
+        crate::dock::grip_handle(
+            &mut self.dock,
+            ui,
+            grip,
+            crate::dock::Palette::Tools,
+            strip,
+            false,
+            theme,
+        );
+        let cols = ((strip.width() - 8.0) / 36.0).floor().max(1.0) as usize;
+        let top_start = strip.top() + 16.0;
+        let bottom_reserve = if strip.height() >= 200.0 { 92.0 } else { 24.0 };
+        if cols == 1 {
+            let room = (strip.height() - 18.0 - bottom_reserve).max(40.0);
+            let buttons = entries.iter().flatten().count() as f32;
+            let gaps = (entries.len() as f32 - buttons) * 8.0;
+            let step = ((room - gaps) / buttons).clamp(20.0, 34.0);
+            let btn_w = (strip.width() - 8.0).clamp(30.0, 44.0);
+            let btn_x = strip.left() + (strip.width() - btn_w) * 0.5;
+            let mut y = top_start;
+            for entry in &entries {
+                let Some((icon, name, tools)) = entry else {
+                    ui.painter().hline(
+                        strip.shrink2(vec2(8.0, 0.0)).x_range(),
+                        y + 3.0,
+                        theme.hairline(),
+                    );
+                    y += 8.0;
+                    continue;
+                };
+                if y + step > strip.bottom() - bottom_reserve + 4.0 {
+                    break;
+                }
+                let rect = Rect::from_min_size(pos2(btn_x, y), vec2(btn_w, step - 2.0));
+                y += step;
+                let is_liquify = *icon == Icon::Replace;
+                let active = match tools.first() {
+                    Some(Tool::Blend) => liquify == is_liquify && current == Tool::Blend,
+                    Some(_) => tools.contains(&current),
+                    None => false,
+                };
+                let tip = match tools.first().and_then(|tool| tool.key()) {
+                    Some(key) => format!("{name} ({key})"),
+                    None => name.clone(),
+                };
+                if icon_button(ui, rect, *icon, true, active, &tip, theme) {
+                    pick_entry(self, *icon, tools);
+                }
+            }
+        } else {
+            let cell_w = ((strip.width() - 8.0) / cols as f32).min(42.0);
+            let grid_left = strip.center().x - (cell_w * cols as f32) * 0.5;
+            let step_y = 32.0;
+            let mut col = 0_usize;
+            let mut y = top_start + 2.0;
+            for entry in &entries {
+                let Some((icon, name, tools)) = entry else {
+                    if col > 0 {
+                        col = 0;
+                        y += step_y;
+                    }
+                    ui.painter().hline(
+                        strip.shrink2(vec2(8.0, 0.0)).x_range(),
+                        y + 3.0,
+                        theme.hairline(),
+                    );
+                    y += 8.0;
+                    continue;
+                };
+                if y + step_y > strip.bottom() - bottom_reserve + 4.0 {
+                    break;
+                }
+                let rect = Rect::from_min_size(
+                    pos2(grid_left + col as f32 * cell_w + 1.0, y),
+                    vec2(cell_w - 2.0, step_y - 2.0),
+                );
+                col += 1;
+                if col >= cols {
+                    col = 0;
+                    y += step_y;
+                }
+                let is_liquify = *icon == Icon::Replace;
+                let active = match tools.first() {
+                    Some(Tool::Blend) => liquify == is_liquify && current == Tool::Blend,
+                    Some(_) => tools.contains(&current),
+                    None => false,
+                };
+                let tip = match tools.first().and_then(|tool| tool.key()) {
+                    Some(key) => format!("{name} ({key})"),
+                    None => name.clone(),
+                };
+                if icon_button(ui, rect, *icon, true, active, &tip, theme) {
+                    pick_entry(self, *icon, tools);
                 }
             }
         }
-        self.color_circles(ui, pos2(strip.left() + 17.0, strip.bottom() - 68.0), theme);
+        if bottom_reserve >= 80.0 {
+            self.color_circles(
+                ui,
+                pos2(strip.center().x - 6.0, strip.bottom() - 68.0),
+                theme,
+            );
+        }
     }
 
     /// The main and sub colors as Clip Studio Paint shows them, in the tool
@@ -1091,17 +1304,24 @@ impl SuePaint {
         cx: &mut AppletContext<'_>,
         theme: &Theme,
     ) {
+        use crate::dock::Palette;
         let tool = self.toolbox.tool();
         let tabs = [
-            (tr!("tool-group"), Icon::SubTool, self.panels.sub_tool),
+            (
+                tr!("tool-group"),
+                Icon::SubTool,
+                self.panels.sub_tool,
+                Palette::SubTool,
+            ),
             (
                 tr!("tool-settings"),
                 Icon::Sliders,
                 self.panels.tool_property,
+                Palette::ToolProperty,
             ),
-            (tr!("brush-size"), Icon::BrushSize, true),
+            (tr!("brush-size"), Icon::BrushSize, true, Palette::BrushGrid),
         ];
-        let (body, clicked) = header(ui, rect, &tabs, self.tool_tab, theme);
+        let (body, clicked) = header(&mut self.dock, ui, rect, &tabs, self.tool_tab, theme);
         if let Some(tab) = clicked {
             self.tool_tab = tab;
         }
@@ -1114,170 +1334,178 @@ impl SuePaint {
             self.brush_size_grid(ui, body.shrink2(vec2(6.0, 6.0)), theme);
             return;
         }
-        let mut inner = child(ui, body.shrink2(vec2(8.0, 6.0)), "tool-panel");
-        if self.tool_tab == 0 {
-            let (group, _) = inner.allocate_exact_size(
-                vec2(inner.available_width().min(140.0), 22.0),
-                Sense::hover(),
-            );
-            inner.painter().rect_filled(
-                group,
-                theme.control_radius,
-                theme.selection.gamma_multiply(0.6),
-            );
-            icons::paint(
-                inner.painter(),
-                Rect::from_center_size(group.left_center() + vec2(12.0, 0.0), vec2(14.0, 14.0)),
-                crate::panels::tool_icon(tool),
-                theme.text,
-            );
-            inner.painter().text(
-                group.left_center() + vec2(24.0, 0.0),
-                Align2::LEFT_CENTER,
-                tool.label(),
-                theme.font(theme.small_size + 0.5),
-                theme.text,
-            );
-            let picked = self.toolbox.picked(tool);
-            let names: Vec<String> = self
-                .toolbox
-                .subs(tool)
-                .iter()
-                .map(|sub| crate::localize(&sub.name))
-                .collect();
-            let tips: Vec<Option<crate::brush::Tip>> = self
-                .toolbox
-                .subs(tool)
-                .iter()
-                .map(|sub| tool.paints().then_some(sub.tip))
-                .collect();
-            egui::ScrollArea::vertical()
-                .id_salt("sue-paint-subs")
-                .show(&mut inner, |ui| {
-                    let mut action = None;
-                    for (index, name) in names.iter().enumerate() {
-                        let chosen = index == picked;
-                        // A painting sub tool is a row with its own sample
-                        // stroke and its name, as in Clip Studio Paint.
-                        let tall = if tips[index].is_some() { 44.0 } else { 26.0 };
-                        let (row, response) = ui
-                            .allocate_exact_size(vec2(ui.available_width(), tall), Sense::click());
-                        let painter = ui.painter();
-                        let fill = if chosen {
-                            theme.active
-                        } else if response.hovered() {
-                            theme.hover
-                        } else {
-                            theme.pill
-                        };
-                        painter.rect_filled(
-                            row.shrink2(vec2(0.0, 1.0)),
-                            theme.control_radius,
-                            fill,
-                        );
-                        if let Some(tip) = tips[index] {
-                            let size = [
-                                (row.width().round() as u32).clamp(40, 600),
-                                (tall as u32) - 8,
-                            ];
-                            if let Some(texture) =
-                                Self::sub_preview(&mut self.sub_previews, cx, tip, size)
-                            {
-                                ui.painter().image(
-                                    texture,
-                                    Rect::from_min_size(
-                                        row.min + vec2(0.0, 2.0),
-                                        vec2(size[0] as f32, size[1] as f32),
-                                    ),
-                                    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                                    if chosen {
-                                        theme.text
-                                    } else {
-                                        theme.text.gamma_multiply(0.85)
-                                    },
-                                );
-                            }
-                            ui.painter().text(
-                                row.right_bottom() + vec2(-6.0, -4.0),
-                                Align2::RIGHT_BOTTOM,
-                                name,
-                                theme.font(theme.small_size + 0.5),
-                                theme.text,
-                            );
-                        } else {
-                            ui.painter().text(
-                                row.left_center() + vec2(8.0, 0.0),
-                                Align2::LEFT_CENTER,
-                                name,
-                                theme.font(theme.small_size + 0.5),
-                                theme.text,
-                            );
-                        }
-                        if response.clicked() {
-                            self.toolbox.pick_sub(tool, index);
-                            self.tool_tab = 1;
-                        }
-                        // Clip Studio Paint's sub tool menu.
-                        response.context_menu(|ui| {
-                            for (what, label) in [
-                                (0, tr!("duplicate-sub-tool")),
-                                (1, tr!("delete-sub-tool")),
-                                (2, tr!("reset-to-initial-settings")),
-                            ] {
-                                if ui
-                                    .add_enabled(
-                                        what != 1 || names.len() > 1,
-                                        egui::Button::new(label),
-                                    )
-                                    .clicked()
-                                {
-                                    action = Some((what, index));
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                    match action {
-                        Some((0, index)) => self.toolbox.duplicate_sub(tool, index),
-                        Some((1, index)) => {
-                            self.toolbox.delete_sub(tool, index);
-                        }
-                        Some((_, index)) => {
-                            self.toolbox.reset_sub(tool, index);
-                        }
-                        None => {}
-                    }
-                    // Clip Studio Paint's Add from downloads: brushes people
-                    // downloaded (Clip Studio's .sut, Photoshop's .abr,
-                    // GIMP's .gbr and .gih, or a picture) become sub tools.
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(format!("+  {}", tr!("add-from-downloads")))
-                                        .size(theme.small_size + 0.5)
-                                        .color(theme.text),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text(tr!("brushes-from-clip-studio-photoshop-gimp"))
-                            .clicked()
-                        {
-                            cx.request(ShellRequest::PickFile(
-                                sue_wm::FilePick::open(
-                                    Some(sue_wm::AppletId::new(crate::ID).expect("a valid id")),
-                                    "brush-import",
-                                    &tr!("add-brushes-from-downloads"),
-                                )
-                                .extensions(&["sut", "abr", "gbr", "gih", "png"]),
-                            ));
-                        }
-                    });
-                });
+        if self.tool_tab == 1 {
+            self.tool_property_body(ui, body, cx, theme, "tool-panel-props");
             return;
         }
-        // Tool Property.
+        let mut inner = child(ui, body.shrink2(vec2(8.0, 6.0)), "tool-panel");
+        let (group, _) = inner.allocate_exact_size(
+            vec2(inner.available_width().min(140.0), 22.0),
+            Sense::hover(),
+        );
+        inner.painter().rect_filled(
+            group,
+            theme.control_radius,
+            theme.selection.gamma_multiply(0.6),
+        );
+        icons::paint(
+            inner.painter(),
+            Rect::from_center_size(group.left_center() + vec2(12.0, 0.0), vec2(14.0, 14.0)),
+            crate::panels::tool_icon(tool),
+            theme.text,
+        );
+        inner.painter().text(
+            group.left_center() + vec2(24.0, 0.0),
+            Align2::LEFT_CENTER,
+            tool.label(),
+            theme.font(theme.small_size + 0.5),
+            theme.text,
+        );
+        let picked = self.toolbox.picked(tool);
+        let names: Vec<String> = self
+            .toolbox
+            .subs(tool)
+            .iter()
+            .map(|sub| crate::localize(&sub.name))
+            .collect();
+        let tips: Vec<Option<crate::brush::Tip>> = self
+            .toolbox
+            .subs(tool)
+            .iter()
+            .map(|sub| tool.paints().then_some(sub.tip))
+            .collect();
+        let standalone_props = self.dock.is_open_panel(Palette::ToolProperty);
+        egui::ScrollArea::vertical()
+            .id_salt("sue-paint-subs")
+            .show(&mut inner, |ui| {
+                let mut action = None;
+                for (index, name) in names.iter().enumerate() {
+                    let chosen = index == picked;
+                    // A painting sub tool is a row with its own sample
+                    // stroke and its name, as in Clip Studio Paint.
+                    let tall = if tips[index].is_some() { 44.0 } else { 26.0 };
+                    let (row, response) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), tall), Sense::click());
+                    let painter = ui.painter();
+                    let fill = if chosen {
+                        theme.active
+                    } else if response.hovered() {
+                        theme.hover
+                    } else {
+                        theme.pill
+                    };
+                    painter.rect_filled(row.shrink2(vec2(0.0, 1.0)), theme.control_radius, fill);
+                    if let Some(tip) = tips[index] {
+                        let size = [
+                            (row.width().round() as u32).clamp(40, 600),
+                            (tall as u32) - 8,
+                        ];
+                        if let Some(texture) =
+                            Self::sub_preview(&mut self.sub_previews, cx, tip, size)
+                        {
+                            ui.painter().image(
+                                texture,
+                                Rect::from_min_size(
+                                    row.min + vec2(0.0, 2.0),
+                                    vec2(size[0] as f32, size[1] as f32),
+                                ),
+                                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
+                                if chosen {
+                                    theme.text
+                                } else {
+                                    theme.text.gamma_multiply(0.85)
+                                },
+                            );
+                        }
+                        ui.painter().text(
+                            row.right_bottom() + vec2(-6.0, -4.0),
+                            Align2::RIGHT_BOTTOM,
+                            name,
+                            theme.font(theme.small_size + 0.5),
+                            theme.text,
+                        );
+                    } else {
+                        ui.painter().text(
+                            row.left_center() + vec2(8.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            name,
+                            theme.font(theme.small_size + 0.5),
+                            theme.text,
+                        );
+                    }
+                    if response.clicked() {
+                        self.toolbox.pick_sub(tool, index);
+                        if !standalone_props {
+                            self.tool_tab = 1;
+                        }
+                    }
+                    // Clip Studio Paint's sub tool menu.
+                    response.context_menu(|ui| {
+                        for (what, label) in [
+                            (0, tr!("duplicate-sub-tool")),
+                            (1, tr!("delete-sub-tool")),
+                            (2, tr!("reset-to-initial-settings")),
+                        ] {
+                            if ui
+                                .add_enabled(what != 1 || names.len() > 1, egui::Button::new(label))
+                                .clicked()
+                            {
+                                action = Some((what, index));
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+                match action {
+                    Some((0, index)) => self.toolbox.duplicate_sub(tool, index),
+                    Some((1, index)) => {
+                        self.toolbox.delete_sub(tool, index);
+                    }
+                    Some((_, index)) => {
+                        self.toolbox.reset_sub(tool, index);
+                    }
+                    None => {}
+                }
+                // Clip Studio Paint's Add from downloads: brushes people
+                // downloaded (Clip Studio's .sut, Photoshop's .abr,
+                // GIMP's .gbr and .gih, or a picture) become sub tools.
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!("+  {}", tr!("add-from-downloads")))
+                                    .size(theme.small_size + 0.5)
+                                    .color(theme.text),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(tr!("brushes-from-clip-studio-photoshop-gimp"))
+                        .clicked()
+                    {
+                        cx.request(ShellRequest::PickFile(
+                            sue_wm::FilePick::open(
+                                Some(sue_wm::AppletId::new(crate::ID).expect("a valid id")),
+                                "brush-import",
+                                &tr!("add-brushes-from-downloads"),
+                            )
+                            .extensions(&["sut", "abr", "gbr", "gih", "png"]),
+                        ));
+                    }
+                });
+            });
+    }
+
+    pub(crate) fn tool_property_body(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        cx: &mut AppletContext<'_>,
+        theme: &Theme,
+        salt: &str,
+    ) {
+        let tool = self.toolbox.tool();
+        let mut inner = child(ui, body.shrink2(vec2(8.0, 6.0)), salt);
         let sub_name = crate::localize(&self.toolbox.current().name);
         inner.horizontal(|ui| {
             ui.label(
@@ -1287,7 +1515,7 @@ impl SuePaint {
             );
             let count = self.toolbox.subs(tool).len();
             if count > 1 {
-                egui::ComboBox::from_id_salt("sue-paint-sub-pick")
+                egui::ComboBox::from_id_salt(("sue-paint-sub-pick", salt))
                     .selected_text("")
                     .width(24.0)
                     .show_ui(ui, |ui| {
@@ -1310,7 +1538,7 @@ impl SuePaint {
             self.stroke_preview(&mut inner, cx, theme);
         }
         let command = egui::ScrollArea::vertical()
-            .id_salt("sue-paint-props")
+            .id_salt(("sue-paint-props", salt))
             .show(&mut inner, |ui| {
                 self.tool_properties(ui, tool, &cx.world.arena, theme)
             })
@@ -3155,13 +3383,29 @@ impl SuePaint {
     // ----- Color ---------------------------------------------------------------------
 
     pub(crate) fn color_panel(&mut self, ui: &mut Ui, rect: Rect, theme: &Theme) {
+        use crate::dock::Palette;
         let tabs = [
-            (tr!("color-wheel"), Icon::Wheel, true),
-            (tr!("color-slider"), Icon::ColorSlider, true),
-            (tr!("intermediate-color"), Icon::Intermediate, true),
-            (tr!("approximate-color"), Icon::Approximate, true),
+            (tr!("color-wheel"), Icon::Wheel, true, Palette::Color),
+            (
+                tr!("color-slider"),
+                Icon::ColorSlider,
+                true,
+                Palette::ColorSlider,
+            ),
+            (
+                tr!("intermediate-color"),
+                Icon::Intermediate,
+                true,
+                Palette::Intermediate,
+            ),
+            (
+                tr!("approximate-color"),
+                Icon::Approximate,
+                true,
+                Palette::Approximate,
+            ),
         ];
-        let (body, clicked) = header(ui, rect, &tabs, self.color_tab, theme);
+        let (body, clicked) = header(&mut self.dock, ui, rect, &tabs, self.color_tab, theme);
         if let Some(tab) = clicked {
             self.color_tab = tab;
         }
@@ -3464,12 +3708,18 @@ impl SuePaint {
         cx: &mut AppletContext<'_>,
         theme: &Theme,
     ) {
+        use crate::dock::Palette;
         let tabs = [
-            (tr!("color-set"), Icon::Swatches, true),
-            (tr!("color-history"), Icon::History, true),
-            (tr!("material"), Icon::Material, true),
+            (tr!("color-set"), Icon::Swatches, true, Palette::ColorSet),
+            (
+                tr!("color-history"),
+                Icon::History,
+                true,
+                Palette::ColorHistory,
+            ),
+            (tr!("material"), Icon::Material, true, Palette::Material),
         ];
-        let (body, clicked) = header(ui, rect, &tabs, self.set_tab, theme);
+        let (body, clicked) = header(&mut self.dock, ui, rect, &tabs, self.set_tab, theme);
         if let Some(tab) = clicked {
             self.set_tab = tab;
         }
@@ -3477,120 +3727,109 @@ impl SuePaint {
             self.material_panel(ui, body.shrink(6.0), cx, theme);
             return;
         }
+        if self.set_tab == 1 {
+            self.color_history_body(ui, body.shrink(6.0), theme, "color-set-history");
+            return;
+        }
         let body = body.shrink(6.0);
         let mut top = body.top();
         let mut bottom = body.bottom();
-        let editing = self.set_tab == 0;
-        if editing {
-            self.color_sets
-                .load(crate::colorsets::folder(cx).as_deref());
-            // The set, its settings, import and export.
-            let row = Rect::from_min_size(body.min, vec2(body.width(), 22.0));
-            let mut inner = child(
-                ui,
-                Rect::from_min_max(row.min, pos2(row.right() - 78.0, row.bottom())),
-                "color-set-pick",
-            );
-            let names: Vec<String> = self
-                .color_sets
-                .sets
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect();
-            let current = self.color_sets.current.min(names.len().saturating_sub(1));
-            egui::ComboBox::from_id_salt("sue-paint-color-set")
-                .selected_text(names.get(current).cloned().unwrap_or_default())
-                .width((row.width() - 90.0).max(60.0))
-                .show_ui(&mut inner, |ui| {
-                    for (index, name) in names.iter().enumerate() {
-                        if ui
-                            .add(egui::Button::selectable(index == current, name))
-                            .clicked()
-                        {
-                            self.color_sets.current = index;
-                            self.color_sets.selected = None;
-                        }
+        self.color_sets
+            .load(crate::colorsets::folder(cx).as_deref());
+        // The set, its settings, import and export.
+        let row = Rect::from_min_size(body.min, vec2(body.width(), 22.0));
+        let mut inner = child(
+            ui,
+            Rect::from_min_max(row.min, pos2(row.right() - 78.0, row.bottom())),
+            "color-set-pick",
+        );
+        let names: Vec<String> = self
+            .color_sets
+            .sets
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let current = self.color_sets.current.min(names.len().saturating_sub(1));
+        egui::ComboBox::from_id_salt("sue-paint-color-set")
+            .selected_text(names.get(current).cloned().unwrap_or_default())
+            .width((row.width() - 90.0).max(60.0))
+            .show_ui(&mut inner, |ui| {
+                for (index, name) in names.iter().enumerate() {
+                    if ui
+                        .add(egui::Button::selectable(index == current, name))
+                        .clicked()
+                    {
+                        self.color_sets.current = index;
+                        self.color_sets.selected = None;
                     }
-                });
-            let icons_at = |index: f32| {
-                Rect::from_min_size(
-                    pos2(row.right() - 76.0 + index * 26.0, row.top()),
-                    vec2(22.0, 22.0),
-                )
-            };
-            if icon_button(
-                ui,
-                icons_at(0.0),
-                Icon::Wrench,
-                true,
-                self.set_menu,
-                &tr!("color-set-settings"),
-                theme,
-            ) {
-                self.set_menu = !self.set_menu;
-            }
-            let me = || sue_wm::AppletId::new(crate::studio::ID).expect("a valid id");
-            if icon_button(
-                ui,
-                icons_at(1.0),
-                Icon::Import,
-                true,
-                false,
-                &tr!("import-color-set-gimp-gpl-hex"),
-                theme,
-            ) {
-                cx.request(ShellRequest::PickFile(
-                    sue_wm::FilePick::open(
-                        Some(me()),
-                        "colorset-import",
-                        &tr!("import-a-color-set"),
-                    )
-                    .extensions(&["gpl", "txt", "hex"]),
-                ));
-            }
-            if icon_button(
-                ui,
-                icons_at(2.0),
-                Icon::Export,
-                true,
-                false,
-                &tr!("export-color-set-gimp-gpl"),
-                theme,
-            ) {
-                let name = names
-                    .get(current)
-                    .cloned()
-                    .unwrap_or_else(|| "Colors".to_owned());
-                cx.request(ShellRequest::PickFile(
-                    sue_wm::FilePick::save(
-                        Some(me()),
-                        "colorset-export",
-                        &tr!("export-the-color-set"),
-                        &format!("{name}.gpl"),
-                    )
-                    .extensions(&["gpl"]),
-                ));
-            }
-            if self.set_menu {
-                self.color_set_menu(ui, icons_at(0.0), cx, theme);
-            }
-            top += 28.0;
-            bottom -= 26.0;
-        }
-        let swatches: Vec<[u8; 3]> = if editing {
-            self.color_sets.colors().to_vec()
-        } else {
-            self.recent.colors().to_vec()
+                }
+            });
+        let icons_at = |index: f32| {
+            Rect::from_min_size(
+                pos2(row.right() - 76.0 + index * 26.0, row.top()),
+                vec2(22.0, 22.0),
+            )
         };
+        if icon_button(
+            ui,
+            icons_at(0.0),
+            Icon::Wrench,
+            true,
+            self.set_menu,
+            &tr!("color-set-settings"),
+            theme,
+        ) {
+            self.set_menu = !self.set_menu;
+        }
+        let me = || sue_wm::AppletId::new(crate::studio::ID).expect("a valid id");
+        if icon_button(
+            ui,
+            icons_at(1.0),
+            Icon::Import,
+            true,
+            false,
+            &tr!("import-color-set-gimp-gpl-hex"),
+            theme,
+        ) {
+            cx.request(ShellRequest::PickFile(
+                sue_wm::FilePick::open(Some(me()), "colorset-import", &tr!("import-a-color-set"))
+                    .extensions(&["gpl", "txt", "hex"]),
+            ));
+        }
+        if icon_button(
+            ui,
+            icons_at(2.0),
+            Icon::Export,
+            true,
+            false,
+            &tr!("export-color-set-gimp-gpl"),
+            theme,
+        ) {
+            let name = names
+                .get(current)
+                .cloned()
+                .unwrap_or_else(|| "Colors".to_owned());
+            cx.request(ShellRequest::PickFile(
+                sue_wm::FilePick::save(
+                    Some(me()),
+                    "colorset-export",
+                    &tr!("export-the-color-set"),
+                    &format!("{name}.gpl"),
+                )
+                .extensions(&["gpl"]),
+            ));
+        }
+        if self.set_menu {
+            self.color_set_menu(ui, icons_at(0.0), cx, theme);
+        }
+        top += 28.0;
+        bottom -= 26.0;
+        let swatches: Vec<[u8; 3]> = self.color_sets.colors().to_vec();
         if swatches.is_empty() {
             ui.painter().text(
                 pos2(body.left() + 2.0, top + 10.0),
                 Align2::LEFT_CENTER,
-                if editing {
-                    tr!("empty-add-drawing-color")
-                } else {
-                    tr!("colors-you-paint-show-here")
-                },
+                tr!("empty-add-drawing-color"),
                 theme.font(theme.small_size + 0.5),
                 theme.muted,
             );
@@ -3620,7 +3859,7 @@ impl SuePaint {
                 Id::unique(("sue-paint-swatch", self.set_tab, index)),
                 Sense::click(),
             );
-            let chosen = editing && self.color_sets.selected == Some(index);
+            let chosen = self.color_sets.selected == Some(index);
             if response.hovered() || chosen {
                 ui.painter().rect_stroke(
                     rect,
@@ -3633,24 +3872,20 @@ impl SuePaint {
             if response.clicked() {
                 self.set_drawing_color(*rgb);
                 self.transparent = false;
-                if editing {
-                    self.color_sets.selected = Some(index);
-                }
+                self.color_sets.selected = Some(index);
             }
-            if editing {
-                response.context_menu(|ui| {
-                    for (what, label) in [
-                        (0, tr!("add-color")),
-                        (1, tr!("replace-color")),
-                        (2, tr!("delete-color")),
-                    ] {
-                        if ui.button(label).clicked() {
-                            swatch_menu = Some((what, index));
-                            ui.close();
-                        }
+            response.context_menu(|ui| {
+                for (what, label) in [
+                    (0, tr!("add-color")),
+                    (1, tr!("replace-color")),
+                    (2, tr!("delete-color")),
+                ] {
+                    if ui.button(label).clicked() {
+                        swatch_menu = Some((what, index));
+                        ui.close();
                     }
-                });
-            }
+                }
+            });
         }
         if let Some((what, index)) = swatch_menu {
             let drawing = self.drawing_color();
@@ -3669,9 +3904,6 @@ impl SuePaint {
                 }
                 self.save_color_sets(cx);
             }
-        }
-        if !editing {
-            return;
         }
         // The drawing colors, and adding, replacing and deleting swatches.
         let row = Rect::from_min_max(pos2(body.left(), bottom + 2.0), body.max);
@@ -3753,6 +3985,66 @@ impl SuePaint {
         }
         if changed {
             self.save_color_sets(cx);
+        }
+    }
+
+    pub(crate) fn color_history_body(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        theme: &Theme,
+        salt: &str,
+    ) {
+        let swatches: Vec<[u8; 3]> = self.recent.colors().to_vec();
+        if swatches.is_empty() {
+            ui.painter().text(
+                pos2(body.left() + 2.0, body.top() + 10.0),
+                Align2::LEFT_CENTER,
+                tr!("colors-you-paint-show-here"),
+                theme.font(theme.small_size + 0.5),
+                theme.muted,
+            );
+            return;
+        }
+        let tile = if self.color_sets.tile > 0.0 {
+            self.color_sets.tile
+        } else {
+            (body.width() / 8.0).floor().max(14.0)
+        };
+        let columns = ((body.width() / tile).floor() as usize).max(1);
+        let cell = (body.width() / columns as f32).floor().max(12.0);
+        for (index, rgb) in swatches.iter().enumerate() {
+            let (column, row) = (index % columns, index / columns);
+            let rect = Rect::from_min_size(
+                pos2(
+                    body.left() + column as f32 * cell,
+                    body.top() + row as f32 * cell,
+                ),
+                vec2(cell - 1.0, cell - 1.0),
+            );
+            if rect.bottom() > body.bottom() {
+                break;
+            }
+            let [r, g, b] = *rgb;
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgb(r, g, b));
+            let response = ui.interact(
+                rect,
+                Id::unique(("sue-paint-hist-swatch", salt, index)),
+                Sense::click(),
+            );
+            if response.hovered() {
+                ui.painter().rect_stroke(
+                    rect,
+                    0.0,
+                    Stroke::new(1.5, theme.border_active),
+                    StrokeKind::Inside,
+                );
+            }
+            if response.on_hover_text(color::hex(*rgb)).clicked() {
+                self.set_drawing_color(*rgb);
+                self.transparent = false;
+            }
         }
     }
 
@@ -3838,9 +4130,15 @@ impl SuePaint {
         ui.painter()
             .vline(rect.right(), rect.y_range(), theme.hairline());
         let (body, _) = header(
+            &mut self.dock,
             ui,
             rect,
-            &[(tr!("tool-sliders"), Icon::Sliders, true)],
+            &[(
+                tr!("tool-sliders"),
+                Icon::Sliders,
+                true,
+                crate::dock::Palette::BrushSize,
+            )],
             0,
             theme,
         );
@@ -3911,13 +4209,33 @@ impl SuePaint {
     ) {
         use crate::dock::Palette;
         let (body, _) = header(
+            &mut self.dock,
             ui,
             rect,
-            &[(palette.title(), palette.icon(), true)],
+            &[(palette.title(), palette.icon(), true, palette)],
             0,
             theme,
         );
         match palette {
+            Palette::ToolProperty => {
+                self.tool_property_body(ui, body, cx, theme, "tool-property-palette");
+            }
+            Palette::BrushGrid => {
+                self.brush_size_grid(ui, body.shrink2(vec2(6.0, 6.0)), theme);
+            }
+            Palette::ColorSlider => {
+                let mut inner = child(ui, body.shrink(8.0), "color-sliders-palette");
+                self.color_sliders(&mut inner, theme);
+            }
+            Palette::Intermediate => {
+                self.intermediate_colors(ui, body.shrink(8.0), theme);
+            }
+            Palette::Approximate => {
+                self.approximate_colors(ui, body.shrink(8.0), theme);
+            }
+            Palette::ColorHistory => {
+                self.color_history_body(ui, body.shrink(6.0), theme, "color-history-palette");
+            }
             Palette::Material => self.material_panel(ui, body, cx, theme),
             Palette::LayerProperty => {
                 let current = self.layer_info(&cx.world.arena);
@@ -3941,12 +4259,14 @@ impl SuePaint {
         cx: &mut AppletContext<'_>,
         theme: &Theme,
     ) {
+        use crate::dock::Palette;
         let (body, clicked) = header(
+            &mut self.dock,
             ui,
             rect,
             &[
-                (tr!("navigator"), Icon::Navigator, true),
-                (tr!("sub-view"), Icon::SubView, true),
+                (tr!("navigator"), Icon::Navigator, true, Palette::Navigator),
+                (tr!("sub-view"), Icon::SubView, true, Palette::SubView),
             ],
             self.nav_tab,
             theme,
@@ -4144,13 +4464,19 @@ impl SuePaint {
         cx: &mut AppletContext<'_>,
         theme: &Theme,
     ) {
+        use crate::dock::Palette;
         let tabs = [
-            (tr!("layer-2"), Icon::Layers, true),
-            (tr!("layer-property"), Icon::LayerProperty, true),
-            (tr!("history"), Icon::History, true),
-            (tr!("animation-cels"), Icon::Cel, true),
+            (tr!("layer-2"), Icon::Layers, true, Palette::Layer),
+            (
+                tr!("layer-property"),
+                Icon::LayerProperty,
+                true,
+                Palette::LayerProperty,
+            ),
+            (tr!("history"), Icon::History, true, Palette::History),
+            (tr!("animation-cels"), Icon::Cel, true, Palette::Cels),
         ];
-        let (body, clicked) = header(ui, rect, &tabs, self.layer_tab, theme);
+        let (body, clicked) = header(&mut self.dock, ui, rect, &tabs, self.layer_tab, theme);
         if let Some(tab) = clicked {
             self.layer_tab = tab;
         }
@@ -4625,14 +4951,24 @@ impl SuePaint {
                     });
                 }
             });
-        if let Some(id) = pick
-            && let Some(doc) = self.doc_mut()
-        {
-            if doc.layer != Some(id) {
-                doc.mask_edit = false;
-                doc.picked.clear();
+        if let Some(id) = pick {
+            let pick_track = self.picture().and_then(|picture| {
+                let sequence = crate::anim::timeline(&cx.world.arena, picture)?;
+                crate::anim::track_of_folder(sequence, id).or_else(|| {
+                    doc::folder_of(&cx.world.arena, id)
+                        .and_then(|folder| crate::anim::track_of_folder(sequence, folder))
+                })
+            });
+            if let Some(doc) = self.doc_mut() {
+                if doc.layer != Some(id) {
+                    doc.mask_edit = false;
+                    doc.picked.clear();
+                }
+                doc.layer = Some(id);
+                if let Some(track) = pick_track {
+                    doc.track = track;
+                }
             }
-            doc.layer = Some(id);
         }
         if let Some(id) = also_pick
             && let Some(doc) = self.doc_mut()
@@ -4674,7 +5010,9 @@ impl SuePaint {
                 .map(|entity| entity.name().to_owned())
                 .unwrap_or_default();
             if !cancelled && !name.is_empty() && name != old {
-                Self::apply(cx, sue_core::txn::Rename::new(id, name));
+                let edit =
+                    crate::anim::rename_layer_or_folder(&cx.world.arena, self.picture(), id, &name);
+                Self::apply(cx, edit);
             }
         }
     }
@@ -5472,9 +5810,15 @@ impl SuePaint {
         ui.painter()
             .hline(rect.x_range(), rect.top(), theme.hairline());
         let (body, _) = header(
+            &mut self.dock,
             ui,
             rect,
-            &[(tr!("timeline"), Icon::Timeline, true)],
+            &[(
+                tr!("timeline"),
+                Icon::Timeline,
+                true,
+                crate::dock::Palette::Timeline,
+            )],
             0,
             theme,
         );

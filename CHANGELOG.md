@@ -13,6 +13,23 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Timeline navigation as in Clip Studio Paint** in Sue Paint: the mouse
+  wheel zooms the frames around the pointer, Shift and the wheel pan them,
+  Alt and the wheel scroll the tracks, Space and drag (or the middle button)
+  pans, and scrollbars along the Timeline's bottom and right edges scroll it.
+- **Flexible panel docking, resizing and workspaces** in Sue Paint: every
+  panel (Command Bar, Tool strip, Sub Tool, Tool Settings, Tool Sliders,
+  Brush Size grid, Color Wheel, Color Slider, Intermediate Color, Approximate
+  Color, Color Set, Color History, Navigator, Sub View, Layer, Layer Property,
+  History, Animation Cels, Timeline, Material, Auto Actions, Item Bank and
+  Info) can be resized and dragged to any left or right column, top or bottom
+  row, icon strip or floating window; Sue Paint remembers your current
+  workspace automatically and adds **Use Current Workspace as Default** and
+  **Reset to Default** under Window, Workspace.
+- **Animation folders in the Layer palette** in Sue Paint: creating an
+  animation folder from the Timeline or Animation menu also creates a matching
+  layer folder in the Layer palette, and every animation cel added to that
+  animation folder goes inside its layer folder.
 - **Pen tilt** in Sue Paint: Brush Size and Opacity dynamics can follow how
   far the pen leans along a curve you shape, flat and calligraphic tips can
   turn with the pen's tilt direction (**Turn with pen tilt** in Brush Tip),

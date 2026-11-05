@@ -7,7 +7,7 @@ use std::path::Path;
 
 use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 use sue_core::EntityId;
-use sue_core::txn::{Rename, SetProperty};
+use sue_core::txn::SetProperty;
 use sue_model::Sequence;
 use sue_platform::write_atomic;
 use sue_wm::{AppletContext, FilePick, FileType, ShellRequest, Theme};
@@ -67,22 +67,22 @@ impl SuePaint {
         if !Self::apply(cx, edit) {
             return;
         }
-        let timeline = anim::new_timeline(picture, fps, frames);
+        let first_layer = doc::layers(&cx.world.arena, picture)
+            .into_iter()
+            .rev()
+            .find(|info| info.kind == sue_model::picture::LayerKind::Raster)
+            .map(|info| info.id);
+        let (timeline, folder) = match first_layer {
+            Some(cel) => {
+                anim::new_timeline_wrapping_cel(&cx.world.arena, picture, cel, fps, frames)
+            }
+            None => anim::new_timeline_in(&cx.world.arena, picture, None, fps, frames),
+        };
         if Self::apply(cx, timeline) {
             self.activate(&cx.world.arena, picture);
-            if let Some(layer) = doc::layers(&cx.world.arena, picture)
-                .into_iter()
-                .rev()
-                .find(|info| info.kind == sue_model::picture::LayerKind::Raster)
-            {
-                Self::apply(
-                    cx,
-                    Edit::new(tr!("name-cel")).then(Rename::new(layer.id, "1")),
-                );
-                if let Some((_, sequence, length)) = self.timeline_here(&cx.world.arena) {
-                    let sequence = anim::assign(&sequence, 0, 0, Some(layer.id), picture, length);
-                    Self::apply(cx, anim::set(picture, sequence, "Specify Cel"));
-                }
+            if let Some(doc) = self.doc_mut() {
+                doc.layer = first_layer.or(Some(folder));
+                doc.track = 0;
             }
         }
     }
@@ -203,11 +203,11 @@ impl SuePaint {
         };
         if let Some(doc) = self.doc_mut() {
             let playing = doc.playing.is_some();
-            let mut view = anim::view(
-                &sequence,
-                doc.frame,
-                (onion && !playing).then_some(&settings),
-            );
+            let onion_now = (onion && !playing).then_some(&settings);
+            let mut view = match picture {
+                Some(picture) => anim::view_in(arena, picture, &sequence, doc.frame, onion_now),
+                None => anim::view(&sequence, doc.frame, onion_now),
+            };
             view.cameras = cameras_at(doc.frame);
             if !playing {
                 view = view
@@ -301,7 +301,15 @@ impl SuePaint {
                 if here.is_some() {
                     cx.notify(tr!("canvas-has-timeline-timeline-palette-edits"));
                 } else {
-                    Self::apply(cx, anim::new_timeline(picture, 24, 24));
+                    let active = self.layer();
+                    let (edit, folder) =
+                        anim::new_timeline_in(&cx.world.arena, picture, active, 24, 24);
+                    if Self::apply(cx, edit)
+                        && let Some(doc) = self.doc_mut()
+                    {
+                        doc.layer = Some(folder);
+                        doc.track = 0;
+                    }
                     self.panels.timeline = true;
                 }
             }
@@ -337,57 +345,29 @@ impl SuePaint {
                     self.anim_command("anim.timeline.new", cx);
                     return true;
                 };
-                let name = tr!(
-                    "animation-folder",
-                    value = anim::folders(&sequence).len() + 1
-                );
-                let edit = anim::set(
-                    picture,
-                    anim::with_folder(&sequence, &name),
-                    "New Animation Folder",
-                );
+                let active = self.layer();
+                let (edit, folder, new_track) =
+                    anim::new_animation_folder(&cx.world.arena, picture, &sequence, active);
                 if Self::apply(cx, edit)
                     && let Some(doc) = self.doc_mut()
                 {
-                    doc.track = sequence.tracks.len();
+                    doc.layer = Some(folder);
+                    doc.track = new_track;
                 }
             }
             "anim.cel.new" => {
-                if here.is_none() {
-                    Self::apply(cx, anim::new_timeline(picture, 24, 24));
-                    self.panels.timeline = true;
-                }
-                let Some((_, sequence, length)) = self.timeline_here(&cx.world.arena) else {
-                    return true;
-                };
-                let track = if anim::folders(&sequence).contains(&track) {
-                    track
-                } else {
-                    anim::folders(&sequence).first().copied().unwrap_or(0)
-                };
-                let count = anim::keys(&sequence.tracks[track], sequence.rate)
-                    .iter()
-                    .filter(|(_, cel)| cel.is_some())
-                    .count();
-                let below = self.doc().and_then(|doc| doc.layer);
-                match doc::add_raster_layer(
-                    &cx.world.arena,
-                    picture,
-                    below,
-                    (count + 1).to_string(),
-                    None,
-                ) {
-                    Ok((spawn, cel)) => {
-                        let sequence =
-                            anim::assign(&sequence, track, frame, Some(cel), picture, length);
-                        let edit = Edit::new(tr!("new-animation-cel"))
-                            .then(spawn)
-                            .then(sue_core::txn::SetExtension::set(picture, sequence));
-                        if Self::apply(cx, edit)
-                            && let Some(doc) = self.doc_mut()
-                        {
-                            doc.layer = Some(cel);
-                            doc.track = track;
+                let had_timeline = here.is_some();
+                let active = self.layer();
+                match anim::new_cel_in(&cx.world.arena, picture, active, track, frame) {
+                    Ok((edit, cel, chosen_track)) => {
+                        if Self::apply(cx, edit) {
+                            if !had_timeline {
+                                self.panels.timeline = true;
+                            }
+                            if let Some(doc) = self.doc_mut() {
+                                doc.layer = Some(cel);
+                                doc.track = chosen_track;
+                            }
                         }
                     }
                     Err(error) => cx.fail(error),
@@ -754,7 +734,7 @@ impl SuePaint {
         };
         let frames = (0..length)
             .filter_map(|frame| {
-                let mut view = anim::view(&sequence, frame, None);
+                let mut view = anim::view_in(arena, picture, &sequence, frame, None);
                 // Seen through the camera folders, as the animation plays.
                 view.cameras = crate::camera::views(
                     arena,
@@ -1068,14 +1048,70 @@ impl SuePaint {
         let fps = anim::fps(&sequence).round().max(1.0) as u32;
         let row_height = 74.0;
         let ruler = 34.0;
+        let ruler_height = ruler;
         let frames_area = Rect::from_min_max(pos2(names.right(), tracks.top()), tracks.max);
-        let step = self.timeline_step.unwrap_or_else(|| {
-            ((frames_area.width() - 8.0) / length.max(1) as f32).clamp(10.0, 26.0)
+        let auto_step = |this: &Self| {
+            this.timeline_step.unwrap_or_else(|| {
+                ((frames_area.width() - 8.0) / length.max(1) as f32).clamp(10.0, 26.0)
+            })
+        };
+        let mut step = auto_step(self);
+        // As Clip Studio Paint: the wheel zooms the frames around the
+        // pointer, Shift and the wheel (or Space and a drag, or the middle
+        // button) pan them, and Alt and the wheel scroll the tracks.
+        let content_height = ruler
+            + anim::folders(&sequence).len() as f32 * row_height
+            + anim::audio_tracks(&sequence).len() as f32 * 26.0;
+        let (hover, wheel, shift, alt, space, middle, motion) = ui.input(|input| {
+            (
+                input.pointer.hover_pos(),
+                input.smooth_scroll_delta,
+                input.modifiers.shift,
+                input.modifiers.alt,
+                input.key_down(egui::Key::Space),
+                input.pointer.middle_down(),
+                input.pointer.delta(),
+            )
         });
+        let over = hover.filter(|pos| frames_area.contains(*pos));
+        let panning = over.is_some() && (space && ui.input(|i| i.pointer.primary_down()) || middle);
+        if let Some(pos) = over {
+            if panning {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                self.timeline_first -= motion.x / step;
+                self.timeline_down -= motion.y;
+            } else if space {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            let amount = wheel.y + if shift { 0.0 } else { wheel.x };
+            if alt && wheel.y != 0.0 {
+                self.timeline_down -= wheel.y;
+            } else if shift && (wheel.y != 0.0 || wheel.x != 0.0) {
+                self.timeline_first -= (wheel.y + wheel.x) / step;
+            } else if amount != 0.0 {
+                let anchor = self.timeline_first + (pos.x - frames_area.left()) / step;
+                let zoomed = (step * (amount * 0.004).exp()).clamp(4.0, 60.0);
+                self.timeline_step = Some(zoomed);
+                step = zoomed;
+                self.timeline_first = anchor - (pos.x - frames_area.left()) / step;
+            }
+        }
+        let visible = tracks.height();
+        self.timeline_down = self
+            .timeline_down
+            .clamp(0.0, (content_height - visible).max(0.0));
         let shown = ((frames_area.width() / step).ceil() as u32).max(1);
-        let first = frame
-            .saturating_sub(shown.saturating_sub(4))
-            .min(length.saturating_sub(shown.saturating_sub(1)));
+        let max_first = length.saturating_sub(shown.saturating_sub(1));
+        if self.timeline_seen != Some(frame) {
+            self.timeline_seen = Some(frame);
+            let now = self.timeline_first.max(0.0) as u32;
+            if frame < now || frame >= now + shown.saturating_sub(1).max(1) {
+                self.timeline_first = frame.saturating_sub(shown.saturating_sub(4)) as f32;
+            }
+        }
+        self.timeline_first = self.timeline_first.clamp(0.0, max_first as f32);
+        let first = self.timeline_first as u32;
+        let down = self.timeline_down;
         let column = |at: u32| frames_area.left() + (at as f32 - first as f32) * step;
         let painter = ui.painter().with_clip_rect(frames_area);
         let below = Rect::from_min_max(
@@ -1184,9 +1220,13 @@ impl SuePaint {
         // One tall row per folder: its name and the picture it shows now in
         // the column, and each key's cel as a picture in the frames.
         let mut action: Option<(usize, u32, Option<Option<EntityId>>)> = None;
-        let names_painter = ui.painter().with_clip_rect(names);
+        let mut toggle_folder: Option<(usize, Option<EntityId>, bool)> = None;
+        // Rows scroll under the ruler, not over it.
+        let names_rows = Rect::from_min_max(pos2(names.left(), tracks.top() + ruler), names.max);
+        let names_painter = ui.painter().with_clip_rect(names_rows);
+        let painter = ui.painter().with_clip_rect(below);
         for (row, index) in anim::folders(&sequence).into_iter().enumerate() {
-            let top = tracks.top() + ruler + row as f32 * row_height;
+            let top = tracks.top() + ruler + row as f32 * row_height - down;
             let name_rect =
                 Rect::from_min_size(pos2(names.left(), top), vec2(names.width(), row_height));
             let chosen = index == track;
@@ -1203,13 +1243,34 @@ impl SuePaint {
             }
             names_painter.hline(names.x_range(), name_rect.bottom(), theme.hairline());
             painter.hline(frames_area.x_range(), name_rect.bottom(), theme.hairline());
+            let linked_folder = anim::folder_in(&cx.world.arena, picture, &sequence.tracks[index]);
+            let folder_visible = linked_folder
+                .and_then(|id| cx.world.arena.get_by_id(id).ok())
+                .map_or(!sequence.tracks[index].muted, |entity| {
+                    sue_model::picture::LayerStyle::of(entity).visible
+                });
             let line = pos2(name_rect.left() + 8.0, top + 11.0);
+            let eye_rect = Rect::from_center_size(line + vec2(6.0, 0.0), vec2(16.0, 16.0));
             crate::icons::paint(
                 &names_painter,
                 Rect::from_center_size(line + vec2(6.0, 0.0), vec2(14.0, 14.0)),
                 Icon::Eye,
-                theme.muted,
+                if folder_visible {
+                    theme.text
+                } else {
+                    theme.muted.gamma_multiply(0.35)
+                },
             );
+            if ui
+                .interact(
+                    eye_rect.intersect(names_rows),
+                    ui.scope_id().with(("timeline-eye", index)),
+                    Sense::click(),
+                )
+                .clicked()
+            {
+                toggle_folder = Some((index, linked_folder, !folder_visible));
+            }
             crate::icons::paint(
                 &names_painter,
                 Rect::from_center_size(line + vec2(26.0, 0.0), vec2(14.0, 14.0)),
@@ -1281,21 +1342,32 @@ impl SuePaint {
             let cells = Rect::from_min_size(
                 pos2(frames_area.left(), top),
                 vec2(frames_area.width(), row_height),
-            );
+            )
+            .intersect(below);
             let response = ui.interact(
                 cells,
                 ui.scope_id().with(("timeline-cells", index)),
                 Sense::click(),
             );
+            let pick_rect = Rect::from_min_max(
+                pos2(name_rect.left() + 24.0, name_rect.top()),
+                name_rect.max,
+            )
+            .intersect(names_rows);
             let name_click = ui.interact(
-                name_rect,
+                pick_rect,
                 ui.scope_id().with(("timeline-folder", index)),
                 Sense::click(),
             );
+            let pick_layer =
+                anim::cel_at(&sequence.tracks[index], sequence.rate, frame).or(linked_folder);
             if name_click.clicked()
                 && let Some(doc) = self.doc_mut()
             {
                 doc.track = index;
+                if let Some(layer) = pick_layer {
+                    doc.layer = Some(layer);
+                }
             }
             let at_pointer = |pos: egui::Pos2| {
                 (first + ((pos.x - frames_area.left()) / step).max(0.0) as u32).min(length - 1)
@@ -1323,6 +1395,7 @@ impl SuePaint {
         }
         // The current frame: a red bar down the frames, as Clip Studio
         // Paint marks it.
+        let painter = ui.painter().with_clip_rect(frames_area);
         let red = Color32::from_rgb(196, 64, 64);
         let current = Rect::from_min_size(
             pos2(column(frame), frames_area.top() + 14.0),
@@ -1336,6 +1409,7 @@ impl SuePaint {
             theme.font(theme.small_size - 1.0),
             Color32::WHITE,
         );
+        let painter = painter.with_clip_rect(below);
         let row_height = 26.0;
         let ruler = ruler + anim::folders(&sequence).len() as f32 * 74.0
             - anim::folders(&sequence).len() as f32 * row_height;
@@ -1343,7 +1417,7 @@ impl SuePaint {
         let rows = anim::folders(&sequence).len();
         let mut audio_edit: Option<(sue_model::Sequence, String)> = None;
         for (row, index) in anim::audio_tracks(&sequence).into_iter().enumerate() {
-            let top = tracks.top() + ruler + (rows + row) as f32 * row_height;
+            let top = tracks.top() + ruler + (rows + row) as f32 * row_height - down;
             let track_ref = &sequence.tracks[index];
             let name_rect =
                 Rect::from_min_size(pos2(names.left(), top), vec2(names.width(), row_height));
@@ -1398,7 +1472,8 @@ impl SuePaint {
             let row_rect = Rect::from_min_size(
                 pos2(frames_area.left(), top),
                 vec2(frames_area.width(), row_height),
-            );
+            )
+            .intersect(below);
             let response = ui.interact(
                 row_rect,
                 ui.scope_id().with(("timeline-audio", index)),
@@ -1407,6 +1482,7 @@ impl SuePaint {
             let at_pointer =
                 |pos: egui::Pos2| first as i64 + ((pos.x - frames_area.left()) / step) as i64;
             if response.drag_started()
+                && !panning
                 && let Some(pos) = response.interact_pointer_pos()
             {
                 self.audio_drag = Some((index, at_pointer(pos), begin));
@@ -1450,8 +1526,88 @@ impl SuePaint {
                 }
             });
         }
+        // Scrollbars over the frames' bottom and right edges, as Clip
+        // Studio Paint's timeline has.
+        let thick = 9.0;
+        let more_down = content_height > visible + 0.5;
+        let right_pad = if more_down { thick } else { 0.0 };
+        if length > shown {
+            let track = Rect::from_min_max(
+                pos2(frames_area.left(), frames_area.bottom() - thick),
+                pos2(frames_area.right() - right_pad, frames_area.bottom()),
+            );
+            let size = (track.width() * shown as f32 / length as f32)
+                .max(24.0)
+                .min(track.width());
+            let room = (track.width() - size).max(1.0);
+            let thumb = Rect::from_min_size(
+                pos2(
+                    track.left() + room * self.timeline_first / max_first.max(1) as f32,
+                    track.top(),
+                ),
+                vec2(size, thick),
+            );
+            let response = ui.interact(track, ui.scope_id().with("timeline-hbar"), Sense::drag());
+            if response.dragged() {
+                self.timeline_first += response.drag_delta().x * max_first as f32 / room;
+                self.timeline_first = self.timeline_first.clamp(0.0, max_first as f32);
+            }
+            let full = ui.painter().with_clip_rect(frames_area);
+            full.rect_filled(track, 0.0, theme.void.gamma_multiply(0.5));
+            full.rect_filled(
+                thumb.shrink2(vec2(0.0, 1.5)),
+                3.0,
+                if response.hovered() || response.dragged() {
+                    theme.muted
+                } else {
+                    theme.muted.gamma_multiply(0.6)
+                },
+            );
+        }
+        if more_down {
+            let track = Rect::from_min_max(
+                pos2(frames_area.right() - thick, tracks.top() + ruler_height),
+                pos2(frames_area.right(), frames_area.bottom() - thick),
+            );
+            let span = content_height - ruler_height;
+            let view = visible - ruler_height;
+            let size = (track.height() * view / span.max(1.0))
+                .max(24.0)
+                .min(track.height().max(1.0));
+            let room = (track.height() - size).max(1.0);
+            let most = (content_height - visible).max(1.0);
+            let thumb = Rect::from_min_size(
+                pos2(track.left(), track.top() + room * self.timeline_down / most),
+                vec2(thick, size),
+            );
+            let response = ui.interact(track, ui.scope_id().with("timeline-vbar"), Sense::drag());
+            if response.dragged() {
+                self.timeline_down += response.drag_delta().y * most / room;
+                self.timeline_down = self.timeline_down.clamp(0.0, most);
+            }
+            let full = ui.painter().with_clip_rect(frames_area);
+            full.rect_filled(track, 0.0, theme.void.gamma_multiply(0.5));
+            full.rect_filled(
+                thumb.shrink2(vec2(1.5, 0.0)),
+                3.0,
+                if response.hovered() || response.dragged() {
+                    theme.muted
+                } else {
+                    theme.muted.gamma_multiply(0.6)
+                },
+            );
+        }
         if let Some((changed, label)) = audio_edit {
             Self::apply(cx, anim::set(picture, changed, &label));
+        }
+        if let Some((index, linked_folder, visible)) = toggle_folder {
+            if let Some(folder) = linked_folder {
+                Self::apply(cx, doc::set(folder, sue_model::picture::VISIBLE, visible));
+            } else {
+                let mut toggled = sequence.clone();
+                toggled.tracks[index].muted = !visible;
+                Self::apply(cx, anim::set(picture, toggled, "Toggle Visibility"));
+            }
         }
         if let Some((index, at, assign)) = action {
             if let Some(doc) = self.doc_mut() {
@@ -1462,6 +1618,12 @@ impl SuePaint {
                 let sequence = anim::assign(&sequence, index, at, cel, picture, length);
                 Self::apply(cx, anim::set(picture, sequence, "Specify Cel"));
                 self.go_to_frame(&cx.world.arena, i64::from(at));
+            } else if anim::cel_at(&sequence.tracks[index], sequence.rate, at).is_none()
+                && let Some(folder) =
+                    anim::folder_in(&cx.world.arena, picture, &sequence.tracks[index])
+                && let Some(doc) = self.doc_mut()
+            {
+                doc.layer = Some(folder);
             }
         }
     }
@@ -1535,7 +1697,26 @@ impl SuePaint {
                                     None => "|".to_owned(),
                                 };
                                 ui.menu_button(text, |ui| {
-                                    for (id, name) in &names {
+                                    let linked = anim::folder_in(
+                                        &cx.world.arena,
+                                        picture,
+                                        &sequence.tracks[*track],
+                                    );
+                                    let scoped: Vec<&(EntityId, String)> = match linked {
+                                        Some(folder) => names
+                                            .iter()
+                                            .filter(|(id, _)| {
+                                                doc::folder_of(&cx.world.arena, *id) == Some(folder)
+                                            })
+                                            .collect(),
+                                        None => Vec::new(),
+                                    };
+                                    let choices: Vec<&(EntityId, String)> = if scoped.is_empty() {
+                                        names.iter().collect()
+                                    } else {
+                                        scoped
+                                    };
+                                    for (id, name) in choices {
                                         if ui.button(name).clicked() {
                                             wanted = Some((*track, frame, Some(Some(*id))));
                                             ui.close();
@@ -1613,13 +1794,30 @@ impl SuePaint {
         };
         let arena = &cx.world.arena;
         let layers = doc::layers(arena, picture);
-        let (read, new_length) = anim::from_sheet_csv(&sequence, length, &text, picture, |name| {
-            layers.iter().map(|info| info.id).find(|id| {
-                arena
-                    .get_by_id(*id)
-                    .is_ok_and(|entity| entity.name() == name)
-            })
-        });
+        let (read, new_length) = anim::from_sheet_csv_for_tracks(
+            &sequence,
+            length,
+            &text,
+            picture,
+            |track_index, name| {
+                let linked = anim::folder_in(arena, picture, &sequence.tracks[track_index]);
+                if let Some(folder) = linked
+                    && let Some(found) = layers.iter().map(|info| info.id).find(|id| {
+                        doc::folder_of(arena, *id) == Some(folder)
+                            && arena
+                                .get_by_id(*id)
+                                .is_ok_and(|entity| entity.name() == name)
+                    })
+                {
+                    return Some(found);
+                }
+                layers.iter().map(|info| info.id).find(|id| {
+                    arena
+                        .get_by_id(*id)
+                        .is_ok_and(|entity| entity.name() == name)
+                })
+            },
+        );
         let mut edit = anim::set(picture, read, &tr!("exposure-sheet"));
         if new_length != length {
             edit = edit.then(SetProperty::new(

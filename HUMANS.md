@@ -531,6 +531,20 @@ Once a canvas is open:
   click an icon to open one. The arrows at the top of a column fold the
   whole column into that strip. The canvas has scrollbars (View, Scroll
   Bar hides them), with the zoom and turn controls beside the bottom one.
+- **Timeline navigation:** over the Timeline's frames, the mouse wheel zooms
+  in and out around the pointer, Shift and the wheel pan sideways, Alt and
+  the wheel scroll the tracks, and holding Space (or the middle button) while
+  dragging pans. Scrollbars sit along the bottom and right edges.
+- **Move, resize and save any workspace:** drag any panel's header or grip
+  (or tear off any secondary tab into its own panel) to dock it in a left
+  or right column, stack it above or below another panel, place it in a top
+  or bottom row, collapse it into the icon strip or float it over the
+  canvas, and drag any edge, splitter or floating corner to resize it
+  (widening the Tool strip turns it into a multi-column palette, and the
+  Command Bar and Timeline move and resize like every other panel). Sue
+  Paint remembers your current layout across launches; under Window,
+  **Workspace**, you can register named workspaces, **Use Current Workspace
+  as Default**, manage saved workspaces and **Reset to Default**.
 - **Launchers:** small bars of buttons under what you are working on, as
   in Clip Studio Paint. Under a transform's box: reset, flip, turn a
   quarter, cancel and OK. Under a text layer's words: edit, smaller,
@@ -705,6 +719,9 @@ Once a canvas is open:
   a blank, | where the one before holds; click a cell to change it. File,
   Export Animation, Exposure Sheet saves it as a CSV file to send or edit,
   and File, Import, Exposure Sheet reads one back.
+  Each animation folder in the Timeline also has its own layer folder in the
+  Layer palette, and every cel added to that animation folder sits inside
+  that layer folder, with their visibility, names and selection kept in step.
 - **Brushes you downloaded:** Add from downloads at the bottom of the
   Tool Group opens a file you downloaded and makes its brushes sub tools
   of the tool out: Clip Studio Paint sub tools (.sut), Photoshop brushes

@@ -1929,6 +1929,10 @@ shows them in their own colors at the light table's opacity. Playback
 advances by the frame rate, and moving to a frame makes its cel the current
 layer. Animations export as an animated GIF
 (`sue_io::encode_gif_animation`) or a numbered picture sequence.
+Each `sue.paint.cels` track also links to its layer folder (`sue.folder`) in
+the picture by `EntityId` (`anim.folder` on the track, remapped by
+`Sequence::remap_entities`), and new cels in that animation folder join its
+layer folder (`sue.paint.member`).
 
 **Other edits.** Fill floods the current layer or all layers within a
 tolerance and grows one pixel under anti-aliased lines; Close gap floods as
@@ -2792,6 +2796,7 @@ separators are measured against, and it exercises the full zero-copy path.
 | §3.7 Sue Paint: Polyline, Selection pen and Erase selection; expand, shrink and blur selections; Select Color Gamut; selection layers; Quick Mask; the Selection Launcher | **Implemented**; a unit test for growing, shrinking, blurring, painting and picking colors, and an end-to-end run that shrinks a full selection, keeps it as a layer and turns Quick Mask on and off | `sue-paint/src/select.rs`, `canvas.rs`, `studio.rs`, `bins/sue/src/runtime.rs` |
 | §3.7 Sue Paint: 3D layers (shapes and OBJ models), their camera and look, and lines and tones from them | **Implemented**; unit tests for the renderer's coverage, outlines and folds (a sphere smooth inside), each look, and a layer turned and undone; an end-to-end run makes a cube, turns it with the Object tool, undoes, converts it to lines and tones and imports an OBJ model | `sue-paint/src/three.rs`, `canvas.rs`, `panels.rs`, `bins/sue/src/runtime.rs` |
 | §3.7 Sue Paint: audio tracks on the animation timeline, played in step | **Implemented**; a unit test for a sound imported, mixed from its frame, moved, removed and undone; the animation end-to-end run imports a WAV and plays and stops it with the animation | `sue-paint/src/anim.rs`, `anim_ui.rs`, `bins/sue/src/runtime.rs` |
+| §3.7 Sue Paint: 4-edge docking, free panel resizing, tear-off tabs, floating palettes and persistent/default workspaces | **Implemented**; every palette (including Command Bar, Tools, Timeline and torn-off companion tabs) resizes and docks in left/right columns, top/bottom rows, icon strips or floating windows, with `current_workspace.txt`, `default_workspace.txt` (**Use Current Workspace as Default**) and **Reset to Default** tested end to end across restarts | `sue-paint/src/dock.rs`, `panels.rs`, `extras.rs`, `dialogs.rs`, `menus.rs`, `bins/sue/src/runtime.rs` |
 | §3.7 Sue Paint: the start page (Draw, Projects with labels and thumbnails, Manage Materials, Data Transfers, Help, Settings) | **Implemented**; unit tests for projects read from the shared work list, sorted and filtered, thumbnails made in the background, pages and popups by name, labels kept, transfers run and cleared, the material library's ids and favorites kept and undone, and every start page widget drawn; the snapshot run shoots the start page and its popups | `sue-paint/src/start.rs`, `materials.rs`, `sue-wm/src/start.rs`, `work.rs`, `transfers.rs`, `bins/sue/src/runtime.rs` |
 | §3.7 Sue Paint: brush tip materials | Partly; brush tips made from pictures list as materials and can be added from PNG files; the Edit menu item is grayed out | `sue-paint/src/materials.rs` |
 | §3.6 Embedded web view | Planned (a Browser drawer of earlier builds was retired) | n/a |
