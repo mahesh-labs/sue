@@ -9,9 +9,12 @@
 //! order before `frame(time)`, so [`ToolRecord`] collects a frame's changes
 //! and commits them together when `frame` arrives.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::os::fd::AsFd;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::JoinHandle;
 
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::fd::OwnedFd;
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
@@ -64,16 +67,27 @@ const BTN_STYLUS3: u32 = 0x149;
 /// Maximum `zwp_tablet_tool_v2.pressure` value in the protocol.
 const MAX_RAW_PRESSURE: f32 = 65_535.0;
 
+/// One Wayland window surface owned by Sue (the main window or a dialog /
+/// floating palette viewport).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SurfaceTarget {
+    pub surface_id: u32,
+    pub viewport: egui::ViewportId,
+    pub to_points: f32,
+}
+
 /// One committed action buffered between `poll` and `take_events`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum BufferedEvent {
     Move {
+        viewport: egui::ViewportId,
         pos: egui::Pos2,
         pressure: Option<f32>,
         tilt: [f32; 2],
         eraser: bool,
     },
     Button {
+        viewport: egui::ViewportId,
         pos: egui::Pos2,
         button: egui::PointerButton,
         pressed: bool,
@@ -81,14 +95,16 @@ enum BufferedEvent {
         tilt: [f32; 2],
         eraser: bool,
     },
-    Gone,
+    Gone {
+        viewport: egui::ViewportId,
+    },
 }
 
 /// Changes accumulated for one tool before `zwp_tablet_tool_v2.frame`.
 #[derive(Clone, Debug, Default)]
 struct PendingFrame {
-    /// `Some((serial, on_our_surface))` when `proximity_in` arrived.
-    proximity_in: Option<(u32, bool)>,
+    /// `Some((serial, surface_protocol_id))` when `proximity_in` arrived.
+    proximity_in: Option<(u32, u32)>,
     proximity_out: bool,
     motion: Option<[f32; 2]>,
     down: bool,
@@ -106,9 +122,13 @@ struct ToolRecord {
     eraser_tool: bool,
     /// Eraser button held on a single-ended barrel-eraser pen.
     eraser_button: bool,
-    /// Tool is currently in proximity over Sue's own `wl_surface`.
-    in_window: bool,
-    /// Latest `proximity_in` serial while `in_window` is `true`.
+    /// Raw Wayland surface id the tool is currently in proximity over.
+    entered_surface: Option<u32>,
+    /// Sue viewport corresponding to `entered_surface`, when it belongs to Sue.
+    in_viewport: Option<egui::ViewportId>,
+    /// Scale factor from surface-local coordinates to `egui` points for `in_viewport`.
+    viewport_to_points: f32,
+    /// Latest `proximity_in` serial while in proximity.
     enter_serial: u32,
     /// Needs a `set_cursor` update after entering proximity.
     needs_cursor: bool,
@@ -131,9 +151,9 @@ impl ToolRecord {
         self.eraser_tool || self.eraser_button
     }
 
-    /// Releases contact and held buttons and leaves the window cleanly.
-    fn leave_window(&mut self, to_points: f32, out: &mut Vec<BufferedEvent>) {
-        if !self.in_window {
+    /// Releases contact and held buttons and leaves the current Sue viewport cleanly.
+    fn leave_window(&mut self, out: &mut Vec<BufferedEvent>) {
+        let Some(viewport) = self.in_viewport.take() else {
             self.touching = false;
             self.pressure = None;
             self.tilt = [0.0, 0.0];
@@ -141,7 +161,12 @@ impl ToolRecord {
             self.held_middle = false;
             self.eraser_button = false;
             return;
-        }
+        };
+        let to_points = if self.viewport_to_points > 0.0 {
+            self.viewport_to_points
+        } else {
+            1.0
+        };
         let pos = self
             .surface_pos
             .map(|[x, y]| egui::pos2(x * to_points, y * to_points))
@@ -151,6 +176,7 @@ impl ToolRecord {
             self.touching = false;
             self.pressure = None;
             out.push(BufferedEvent::Button {
+                viewport,
                 pos,
                 button: egui::PointerButton::Primary,
                 pressed: false,
@@ -162,6 +188,7 @@ impl ToolRecord {
         if self.held_secondary {
             self.held_secondary = false;
             out.push(BufferedEvent::Button {
+                viewport,
                 pos,
                 button: egui::PointerButton::Secondary,
                 pressed: false,
@@ -173,6 +200,7 @@ impl ToolRecord {
         if self.held_middle {
             self.held_middle = false;
             out.push(BufferedEvent::Button {
+                viewport,
                 pos,
                 button: egui::PointerButton::Middle,
                 pressed: false,
@@ -181,40 +209,70 @@ impl ToolRecord {
                 eraser,
             });
         }
-        self.in_window = false;
         self.needs_cursor = false;
         self.pressure = None;
         self.tilt = [0.0, 0.0];
         self.eraser_button = false;
-        out.push(BufferedEvent::Gone);
+        out.push(BufferedEvent::Gone { viewport });
     }
 
     /// Commits one `zwp_tablet_tool_v2.frame`, turning all events gathered
     /// since the previous `frame` into ordered [`BufferedEvent`]s.
-    fn commit_frame(&mut self, to_points: f32, out: &mut Vec<BufferedEvent>) {
+    fn commit_frame(&mut self, surfaces: &[SurfaceTarget], out: &mut Vec<BufferedEvent>) {
         let frame = std::mem::take(&mut self.pending);
 
-        if let Some((serial, ours)) = frame.proximity_in {
-            if !ours {
-                self.leave_window(to_points, out);
-            } else {
-                if !self.in_window {
-                    self.touching = false;
-                    self.pressure = None;
-                    self.held_secondary = false;
-                    self.held_middle = false;
+        if let Some((serial, surface_id)) = frame.proximity_in {
+            self.entered_surface = Some(surface_id);
+            self.enter_serial = serial;
+            let matched = surfaces
+                .iter()
+                .find(|s| s.surface_id == surface_id)
+                .copied();
+            match matched {
+                None => {
+                    self.leave_window(out);
                 }
-                self.in_window = true;
-                self.enter_serial = serial;
-                self.needs_cursor = true;
+                Some(target) => {
+                    if self.in_viewport != Some(target.viewport) {
+                        self.leave_window(out);
+                        self.touching = false;
+                        self.pressure = None;
+                        self.held_secondary = false;
+                        self.held_middle = false;
+                    }
+                    self.in_viewport = Some(target.viewport);
+                    self.viewport_to_points = target.to_points;
+                    self.needs_cursor = true;
+                }
+            }
+        } else if let Some(surface_id) = self.entered_surface {
+            // Keep `to_points` up to date on fractional scale changes, and
+            // attach viewports whose `wl_surface` registered right after enter.
+            if let Some(target) = surfaces
+                .iter()
+                .find(|s| s.surface_id == surface_id)
+                .copied()
+            {
+                if self.in_viewport != Some(target.viewport) {
+                    self.leave_window(out);
+                    self.in_viewport = Some(target.viewport);
+                    self.needs_cursor = true;
+                }
+                self.viewport_to_points = target.to_points;
+            } else if self.in_viewport.is_some() {
+                self.leave_window(out);
             }
         }
 
-        if !self.in_window {
+        let Some(viewport) = self.in_viewport else {
+            if frame.proximity_out {
+                self.entered_surface = None;
+            }
             self.touching = false;
             self.pressure = None;
             return;
-        }
+        };
+        let to_points = self.viewport_to_points;
 
         if let Some(motion) = frame.motion {
             self.surface_pos = Some(motion);
@@ -245,6 +303,7 @@ impl ToolRecord {
         {
             let active_pressure = if self.touching { self.pressure } else { None };
             out.push(BufferedEvent::Move {
+                viewport,
                 pos,
                 pressure: active_pressure,
                 tilt: self.tilt,
@@ -255,6 +314,7 @@ impl ToolRecord {
             && let Some(pos) = pos
         {
             out.push(BufferedEvent::Move {
+                viewport,
                 pos,
                 pressure: None,
                 tilt: self.tilt,
@@ -267,10 +327,16 @@ impl ToolRecord {
             // Some tablets send `down` with pressure > 0 in the next frame;
             // start with a light positive pressure if none arrived yet so the
             // stroke sees a pen rather than a mouse's full 1.0.
-            let contact_pressure = Some(self.pressure.unwrap_or(0.05).clamp(0.0, 1.0));
+            let contact_pressure = Some(
+                self.pressure
+                    .filter(|&p| p > 0.0)
+                    .unwrap_or(0.05)
+                    .clamp(0.0, 1.0),
+            );
             self.pressure = contact_pressure;
             if let Some(pos) = pos {
                 out.push(BufferedEvent::Button {
+                    viewport,
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: true,
@@ -297,6 +363,7 @@ impl ToolRecord {
             if let (Some(button), Some(pos)) = (mapped, pos) {
                 let active_pressure = if self.touching { self.pressure } else { None };
                 out.push(BufferedEvent::Button {
+                    viewport,
                     pos,
                     button,
                     pressed,
@@ -315,6 +382,7 @@ impl ToolRecord {
                 && let Some(pos) = pos
             {
                 out.push(BufferedEvent::Move {
+                    viewport,
                     pos,
                     pressure: self.pressure,
                     tilt: self.tilt,
@@ -325,6 +393,7 @@ impl ToolRecord {
             self.pressure = None;
             if let Some(pos) = pos {
                 out.push(BufferedEvent::Button {
+                    viewport,
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: false,
@@ -336,7 +405,8 @@ impl ToolRecord {
         }
 
         if frame.proximity_out {
-            self.leave_window(to_points, out);
+            self.entered_surface = None;
+            self.leave_window(out);
         }
     }
 }
@@ -353,8 +423,7 @@ struct LiveTool {
 }
 
 struct WaylandState {
-    surface_id: u32,
-    to_points: f32,
+    surfaces: Vec<SurfaceTarget>,
     compositor: Option<WlCompositor>,
     shm: Option<WlShm>,
     manager: Option<ZwpTabletManagerV2>,
@@ -366,10 +435,13 @@ struct WaylandState {
 }
 
 impl WaylandState {
-    fn new(surface_id: u32) -> Self {
+    fn new(root_surface_id: u32) -> Self {
         Self {
-            surface_id,
-            to_points: 1.0,
+            surfaces: vec![SurfaceTarget {
+                surface_id: root_surface_id,
+                viewport: egui::ViewportId::ROOT,
+                to_points: 1.0,
+            }],
             compositor: None,
             shm: None,
             manager: None,
@@ -397,43 +469,18 @@ impl WaylandState {
         &mut self.tools[last]
     }
 
-    fn in_proximity(&self) -> bool {
-        self.tools.iter().any(|tool| tool.record.in_window)
-    }
-
     fn apply_cursors(
         &mut self,
         conn: &Connection,
         qh: &QueueHandle<Self>,
-        icon: egui::CursorIcon,
-        scale: i32,
+        mut cursor_for: impl FnMut(egui::ViewportId) -> (egui::CursorIcon, i32),
     ) {
-        let scale = scale.max(1);
-        let needs_any = self.tools.iter().any(|tool| {
-            tool.record.in_window
-                && (tool.record.needs_cursor || tool.applied_cursor != Some((icon, scale)))
-        });
-        if !needs_any {
-            return;
-        }
-
-        if icon != egui::CursorIcon::None {
-            let reload = self
-                .cursor_theme
-                .as_ref()
-                .is_none_or(|(loaded_scale, _)| *loaded_scale != scale);
-            if reload
-                && let Some(shm) = self.shm.clone()
-                && let Ok(theme) = CursorTheme::load(conn, shm, (24 * scale) as u32)
-            {
-                self.cursor_theme = Some((scale, theme));
-            }
-        }
-
         for tool in &mut self.tools {
-            if !tool.record.in_window {
+            let Some(viewport) = tool.record.in_viewport else {
                 continue;
-            }
+            };
+            let (icon, raw_scale) = cursor_for(viewport);
+            let scale = raw_scale.max(1);
             if !tool.record.needs_cursor && tool.applied_cursor == Some((icon, scale)) {
                 continue;
             }
@@ -443,6 +490,17 @@ impl WaylandState {
             if icon == egui::CursorIcon::None {
                 tool.proxy.set_cursor(tool.record.enter_serial, None, 0, 0);
                 continue;
+            }
+
+            let reload = self
+                .cursor_theme
+                .as_ref()
+                .is_none_or(|(loaded_scale, _)| *loaded_scale != scale);
+            if reload
+                && let Some(shm) = self.shm.clone()
+                && let Ok(theme) = CursorTheme::load(conn, shm, (24 * scale) as u32)
+            {
+                self.cursor_theme = Some((scale, theme));
             }
 
             let Some(compositor) = self.compositor.as_ref() else {
@@ -627,8 +685,6 @@ impl Dispatch<ZwpTabletToolV2, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let surface_id = state.surface_id;
-        let to_points = state.to_points;
         match event {
             zwp_tablet_tool_v2::Event::Type {
                 tool_type: WEnum::Value(ToolType::Eraser),
@@ -638,8 +694,8 @@ impl Dispatch<ZwpTabletToolV2, ()> for WaylandState {
             zwp_tablet_tool_v2::Event::ProximityIn {
                 serial, surface, ..
             } => {
-                let ours = surface.id().protocol_id() == surface_id;
-                state.tool_mut(proxy).record.pending.proximity_in = Some((serial, ours));
+                let sid = surface.id().protocol_id();
+                state.tool_mut(proxy).record.pending.proximity_in = Some((serial, sid));
             }
             zwp_tablet_tool_v2::Event::ProximityOut => {
                 state.tool_mut(proxy).record.pending.proximity_out = true;
@@ -676,10 +732,11 @@ impl Dispatch<ZwpTabletToolV2, ()> for WaylandState {
             zwp_tablet_tool_v2::Event::Frame { .. } => {
                 let id = proxy.id();
                 if let Some(index) = state.tools.iter().position(|tool| tool.id == id) {
+                    let surfaces = state.surfaces.clone();
                     let mut buffered = std::mem::take(&mut state.buffered);
                     state.tools[index]
                         .record
-                        .commit_frame(to_points, &mut buffered);
+                        .commit_frame(&surfaces, &mut buffered);
                     state.buffered = buffered;
                 }
             }
@@ -687,7 +744,7 @@ impl Dispatch<ZwpTabletToolV2, ()> for WaylandState {
                 let id = proxy.id();
                 if let Some(index) = state.tools.iter().position(|tool| tool.id == id) {
                     let mut removed = state.tools.swap_remove(index);
-                    removed.record.leave_window(to_points, &mut state.buffered);
+                    removed.record.leave_window(&mut state.buffered);
                     if let Some(surface) = removed.cursor_surface.take() {
                         surface.destroy();
                     }
@@ -772,16 +829,17 @@ impl Dispatch<ZwpTabletPadDialV2, ()> for WaylandState {
     }
 }
 
-/// Converts buffered tablet events into `egui::Event`s and synchronized
-/// [`stylus::Sample`]s in lockstep.
+/// Converts buffered tablet events into `egui::Event`s routed by `ViewportId`
+/// and synchronized [`stylus::Sample`]s in lockstep.
 fn flush_buffered(
     buffered: &mut Vec<BufferedEvent>,
     modifiers: egui::Modifiers,
-    into: &mut Vec<egui::Event>,
+    mut route: impl FnMut(egui::ViewportId, egui::Event),
 ) {
     for item in buffered.drain(..) {
         match item {
             BufferedEvent::Move {
+                viewport,
                 pos,
                 pressure,
                 tilt,
@@ -797,9 +855,10 @@ fn flush_buffered(
                         eraser,
                     },
                 );
-                into.push(egui::Event::PointerMoved(pos));
+                route(viewport, egui::Event::PointerMoved(pos));
             }
             BufferedEvent::Button {
+                viewport,
                 pos,
                 button,
                 pressed,
@@ -821,34 +880,135 @@ fn flush_buffered(
                         eraser,
                     },
                 );
-                into.push(egui::Event::PointerButton {
-                    pos,
-                    button,
-                    pressed,
-                    modifiers,
-                });
+                route(
+                    viewport,
+                    egui::Event::PointerButton {
+                        pos,
+                        button,
+                        pressed,
+                        modifiers,
+                    },
+                );
             }
-            BufferedEvent::Gone => {
+            BufferedEvent::Gone { viewport } => {
                 stylus::set_state(PenSource::Wayland, None, [0.0, 0.0], false);
-                into.push(egui::Event::PointerGone);
+                route(viewport, egui::Event::PointerGone);
             }
         }
     }
 }
 
+#[derive(Default)]
+struct WakeFlags {
+    armed: bool,
+    polling: bool,
+    stop: bool,
+}
+
+/// Watches the shared `wl_display` socket fd while `winit` sleeps in
+/// `ControlFlow::Wait` or `ControlFlow::WaitUntil` without calling any
+/// `libwayland` functions, nudging `winit`'s `EventLoopProxy` when a
+/// `zwp_tablet_tool_v2` packet arrives so `winit` does not ignore the wakeup
+/// as spurious when its own `wl_pointer` queue is empty.
+struct IdleWake {
+    state: Arc<(Mutex<WakeFlags>, Condvar)>,
+    stop_write: OwnedFd,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl IdleWake {
+    fn spawn(conn: Connection, proxy: winit::event_loop::EventLoopProxy<()>) -> Option<Self> {
+        let (stop_read, stop_write) = rustix::pipe::pipe().ok()?;
+        let state = Arc::new((Mutex::new(WakeFlags::default()), Condvar::new()));
+        let shared = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("sue-wayland-tablet".to_owned())
+            .spawn(move || {
+                let (lock, cvar) = &*shared;
+                loop {
+                    let mut flags = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    while !flags.armed && !flags.stop {
+                        flags = cvar.wait(flags).unwrap_or_else(PoisonError::into_inner);
+                    }
+                    if flags.stop {
+                        break;
+                    }
+                    flags.armed = false;
+                    flags.polling = true;
+                    drop(flags);
+
+                    let mut fds = [
+                        PollFd::from_borrowed_fd(conn.as_fd(), PollFlags::IN),
+                        PollFd::from_borrowed_fd(stop_read.as_fd(), PollFlags::IN),
+                    ];
+                    let _ = rustix::event::poll(&mut fds, None);
+
+                    let mut flags = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    flags.polling = false;
+                    if flags.stop || !fds[1].revents().is_empty() {
+                        break;
+                    }
+                    drop(flags);
+
+                    if !fds[0].revents().is_empty() {
+                        let _ = proxy.send_event(());
+                    }
+                }
+            })
+            .ok()?;
+
+        Some(Self {
+            state,
+            stop_write,
+            thread: Some(thread),
+        })
+    }
+
+    fn arm(&self) {
+        let (lock, cvar) = &*self.state;
+        let mut flags = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if !flags.polling && !flags.stop {
+            flags.armed = true;
+            cvar.notify_one();
+        }
+    }
+}
+
+impl Drop for IdleWake {
+    fn drop(&mut self) {
+        {
+            let (lock, cvar) = &*self.state;
+            let mut flags = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            flags.stop = true;
+            cvar.notify_one();
+        }
+        let _ = rustix::io::write(&self.stop_write, &[1u8]);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// A connection to Wayland's `tablet-v2` protocol sharing `winit`'s display.
+///
+/// Field drop order matters: `idle_wake` joins before `queue` and `window_conn`
+/// drop, while `window`'s `wl_display` is still alive.
 pub(crate) struct Pen {
-    window_conn: sue_wayland::WindowConnection,
+    idle_wake: Option<IdleWake>,
     queue: EventQueue<WaylandState>,
     qh: QueueHandle<WaylandState>,
     state: WaylandState,
+    window_conn: sue_wayland::WindowConnection,
     cursor_icon: egui::CursorIcon,
 }
 
 impl Pen {
     /// Opens a `tablet-v2` event queue on `window`'s Wayland connection, or
     /// returns `None` on X11 or when the compositor exposes no tablet manager.
-    pub(crate) fn open(window: &Arc<Window>) -> Option<Self> {
+    pub(crate) fn open(
+        window: &Arc<Window>,
+        proxy: winit::event_loop::EventLoopProxy<()>,
+    ) -> Option<Self> {
         let window_conn = sue_wayland::WindowConnection::open(window)?;
         let conn = window_conn.connection();
         let mut queue = conn.new_event_queue();
@@ -863,60 +1023,99 @@ impl Pen {
         // pad announcements from each bound `zwp_tablet_seat_v2`.
         let _ = queue.roundtrip(&mut state);
 
+        let idle_wake = IdleWake::spawn(conn.clone(), proxy);
+
         Some(Self {
-            window_conn,
+            idle_wake,
             queue,
             qh,
             state,
+            window_conn,
             cursor_icon: egui::CursorIcon::Default,
         })
     }
 
+    /// The Wayland protocol id (`wl_surface@...`) of the main window.
+    pub(crate) fn root_surface_id(&self) -> u32 {
+        self.window_conn.surface_id()
+    }
+
     /// Reads any pending Wayland tablet frames without blocking. Returns
     /// `true` when new pointer events are waiting for a frame.
-    pub(crate) fn poll(&mut self, to_points: f32, scale: i32) -> bool {
-        self.state.to_points = to_points;
+    ///
+    /// Note: `libwayland-client` requires checking `poll(POLLIN)` before
+    /// calling `ReadEventsGuard::read()`, otherwise `wl_display_read_events`
+    /// blocks on `pthread_cond_wait` whenever another reader (such as the
+    /// Vulkan Wayland WSI thread) holds a prepared read guard on an empty
+    /// socket.
+    pub(crate) fn poll(&mut self, surfaces: Vec<SurfaceTarget>, root_scale: i32) -> bool {
+        self.state.surfaces = surfaces;
         let _ = self.queue.dispatch_pending(&mut self.state);
-        if let Some(guard) = self.queue.prepare_read() {
-            let _ = guard.read();
+        while let Some(guard) = self.queue.prepare_read() {
+            let zero = Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let mut fds = [PollFd::from_borrowed_fd(
+                guard.connection_fd(),
+                PollFlags::IN,
+            )];
+            if rustix::event::poll(&mut fds, Some(&zero)).is_ok_and(|ready| ready > 0)
+                && !fds[0].revents().is_empty()
+            {
+                let _ = guard.read();
+                let _ = self.queue.dispatch_pending(&mut self.state);
+            } else {
+                // Dropping `guard` calls `wl_display_cancel_read` immediately.
+                break;
+            }
         }
-        let _ = self.queue.dispatch_pending(&mut self.state);
-        self.state.apply_cursors(
-            self.window_conn.connection(),
-            &self.qh,
-            self.cursor_icon,
-            scale,
-        );
+        let icon = self.cursor_icon;
+        self.state
+            .apply_cursors(self.window_conn.connection(), &self.qh, |_| {
+                (icon, root_scale)
+            });
         let _ = self.queue.flush();
         !self.state.buffered.is_empty()
     }
 
+    /// Arms the zero-CPU socket watcher before `winit` blocks in `Wait` or
+    /// `WaitUntil`.
+    pub(crate) fn arm_wake(&self) {
+        if let Some(wake) = self.idle_wake.as_ref() {
+            wake.arm();
+        }
+    }
+
     /// Updates the cursor icon shown for any tablet tool currently in
-    /// proximity over Sue's window.
-    pub(crate) fn set_cursor(&mut self, icon: egui::CursorIcon, scale: i32) {
-        self.cursor_icon = icon;
-        self.state.apply_cursors(
-            self.window_conn.connection(),
-            &self.qh,
-            self.cursor_icon,
-            scale,
-        );
+    /// proximity over any of Sue's windows.
+    pub(crate) fn set_cursors(
+        &mut self,
+        root_icon: egui::CursorIcon,
+        root_scale: i32,
+        mut child_cursor: impl FnMut(egui::ViewportId) -> Option<(egui::CursorIcon, i32)>,
+    ) {
+        self.cursor_icon = root_icon;
+        self.state
+            .apply_cursors(self.window_conn.connection(), &self.qh, |viewport| {
+                if viewport == egui::ViewportId::ROOT {
+                    (root_icon, root_scale)
+                } else {
+                    child_cursor(viewport).unwrap_or((root_icon, root_scale))
+                }
+            });
         let _ = self.queue.flush();
     }
 
-    /// Moves buffered pointer events into `into` and pushes their matching
-    /// per-sample pressure, tilt and eraser readings to [`crate::stylus`].
-    pub(crate) fn take_events(&mut self, modifiers: egui::Modifiers, into: &mut Vec<egui::Event>) {
-        flush_buffered(&mut self.state.buffered, modifiers, into);
-    }
-
-    /// While the pen hovers or draws over Sue's window, wake again within 4 ms
-    /// (~250 Hz); when the pen is away, `winit`'s epoll on the shared
-    /// `wl_display` fd wakes the loop as soon as `proximity_in` arrives.
-    pub(crate) fn wake_after(&self) -> Option<Duration> {
-        self.state
-            .in_proximity()
-            .then_some(Duration::from_millis(4))
+    /// Routes buffered pointer events to their target `ViewportId` and pushes
+    /// their matching per-sample pressure, tilt and eraser readings to
+    /// [`crate::stylus`].
+    pub(crate) fn take_events(
+        &mut self,
+        modifiers: egui::Modifiers,
+        route: impl FnMut(egui::ViewportId, egui::Event),
+    ) {
+        flush_buffered(&mut self.state.buffered, modifiers, route);
     }
 }
 
@@ -924,19 +1123,28 @@ impl Pen {
 mod tests {
     use super::*;
 
+    fn root_target(to_points: f32) -> [SurfaceTarget; 1] {
+        [SurfaceTarget {
+            surface_id: 30,
+            viewport: egui::ViewportId::ROOT,
+            to_points,
+        }]
+    }
+
     #[test]
     fn frame_commits_down_with_same_frame_motion_pressure_and_tilt() {
         let _guard = stylus::lock_for_test();
         stylus::end_frame();
+        let surfaces = root_target(0.5);
         let mut tool = ToolRecord::default();
         let mut buffered = Vec::new();
 
         // KWin sends `proximity_in` + `motion` + `tilt` in the first frame.
-        tool.pending.proximity_in = Some((42, true));
+        tool.pending.proximity_in = Some((42, 30));
         tool.pending.motion = Some([100.0, 200.0]);
         tool.pending.tilt = Some([12.5, -8.0]);
-        tool.commit_frame(0.5, &mut buffered);
-        assert!(tool.in_window);
+        tool.commit_frame(&surfaces, &mut buffered);
+        assert_eq!(tool.in_viewport, Some(egui::ViewportId::ROOT));
         assert!(tool.needs_cursor);
         assert_eq!(tool.enter_serial, 42);
 
@@ -946,20 +1154,23 @@ mod tests {
         tool.pending.motion = Some([110.0, 220.0]);
         tool.pending.pressure = Some(0.4);
         tool.pending.tilt = Some([15.0, -10.0]);
-        tool.commit_frame(0.5, &mut buffered);
+        tool.commit_frame(&surfaces, &mut buffered);
 
         // Next two stroke frames at 200 Hz with distinct pressures and tilts.
         tool.pending.motion = Some([130.0, 240.0]);
         tool.pending.pressure = Some(0.75);
         tool.pending.tilt = Some([20.0, -12.0]);
-        tool.commit_frame(0.5, &mut buffered);
+        tool.commit_frame(&surfaces, &mut buffered);
 
         tool.pending.up = true;
         tool.pending.proximity_out = true;
-        tool.commit_frame(0.5, &mut buffered);
+        tool.commit_frame(&surfaces, &mut buffered);
 
         let mut events = Vec::new();
-        flush_buffered(&mut buffered, egui::Modifiers::NONE, &mut events);
+        flush_buffered(&mut buffered, egui::Modifiers::NONE, |vp, ev| {
+            assert_eq!(vp, egui::ViewportId::ROOT);
+            events.push(ev);
+        });
         let samples = stylus::take_samples();
 
         assert_eq!(
@@ -1001,67 +1212,76 @@ mod tests {
     }
 
     #[test]
-    fn barrel_buttons_and_eraser_tool_map_cleanly_and_release_on_leave() {
+    fn barrel_buttons_and_dialog_viewports_route_cleanly() {
         let _guard = stylus::lock_for_test();
         stylus::end_frame();
+        let dialog_vp = egui::ViewportId::from_hash_of("pen-pressure-dialog");
+        let surfaces = [
+            SurfaceTarget {
+                surface_id: 30,
+                viewport: egui::ViewportId::ROOT,
+                to_points: 1.0,
+            },
+            SurfaceTarget {
+                surface_id: 77,
+                viewport: dialog_vp,
+                to_points: 1.0,
+            },
+        ];
         let mut tool = ToolRecord {
             eraser_tool: true,
             ..ToolRecord::default()
         };
         let mut buffered = Vec::new();
 
-        // Events on another window's surface are ignored.
-        tool.pending.proximity_in = Some((1, false));
+        // Events on a foreign app's surface (id 999) are ignored.
+        tool.pending.proximity_in = Some((1, 999));
         tool.pending.motion = Some([10.0, 10.0]);
         tool.pending.down = true;
-        tool.commit_frame(1.0, &mut buffered);
+        tool.commit_frame(&surfaces, &mut buffered);
         assert!(buffered.is_empty());
 
-        // Entering our window and pressing both barrel buttons.
-        tool.pending.proximity_in = Some((2, true));
+        // Entering the main window and pressing both barrel buttons.
+        tool.pending.proximity_in = Some((2, 30));
         tool.pending.motion = Some([30.0, 40.0]);
         tool.pending.buttons = vec![(BTN_STYLUS, true), (BTN_STYLUS2, true)];
-        tool.commit_frame(1.0, &mut buffered);
+        tool.commit_frame(&surfaces, &mut buffered);
 
-        // Moving onto another surface releases held barrel buttons and emits Gone.
-        tool.pending.proximity_in = Some((3, false));
-        tool.commit_frame(1.0, &mut buffered);
+        // Moving onto the Pen Pressure Settings dialog (id 77) releases held
+        // buttons + Gone on ROOT, then delivers motion + press to `dialog_vp`.
+        tool.pending.proximity_in = Some((3, 77));
+        tool.pending.motion = Some([15.0, 25.0]);
+        tool.pending.down = true;
+        tool.pending.pressure = Some(0.6);
+        tool.commit_frame(&surfaces, &mut buffered);
 
-        let mut events = Vec::new();
-        flush_buffered(&mut buffered, egui::Modifiers::ALT, &mut events);
+        let mut routed = Vec::new();
+        flush_buffered(&mut buffered, egui::Modifiers::ALT, |vp, ev| {
+            routed.push((vp, ev));
+        });
         let samples = stylus::take_samples();
 
         assert!(samples.iter().take(3).all(|sample| sample.eraser));
+        assert_eq!(routed[0].0, egui::ViewportId::ROOT);
         assert_eq!(
-            events,
-            vec![
-                egui::Event::PointerMoved(egui::pos2(30.0, 40.0)),
+            routed[5],
+            (egui::ViewportId::ROOT, egui::Event::PointerGone)
+        );
+        assert_eq!(
+            routed[6],
+            (dialog_vp, egui::Event::PointerMoved(egui::pos2(15.0, 25.0)))
+        );
+        assert_eq!(
+            routed[7],
+            (
+                dialog_vp,
                 egui::Event::PointerButton {
-                    pos: egui::pos2(30.0, 40.0),
-                    button: egui::PointerButton::Secondary,
+                    pos: egui::pos2(15.0, 25.0),
+                    button: egui::PointerButton::Primary,
                     pressed: true,
                     modifiers: egui::Modifiers::ALT,
-                },
-                egui::Event::PointerButton {
-                    pos: egui::pos2(30.0, 40.0),
-                    button: egui::PointerButton::Middle,
-                    pressed: true,
-                    modifiers: egui::Modifiers::ALT,
-                },
-                egui::Event::PointerButton {
-                    pos: egui::pos2(30.0, 40.0),
-                    button: egui::PointerButton::Secondary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::ALT,
-                },
-                egui::Event::PointerButton {
-                    pos: egui::pos2(30.0, 40.0),
-                    button: egui::PointerButton::Middle,
-                    pressed: false,
-                    modifiers: egui::Modifiers::ALT,
-                },
-                egui::Event::PointerGone,
-            ]
+                }
+            )
         );
         stylus::end_frame();
     }

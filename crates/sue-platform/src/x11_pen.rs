@@ -9,7 +9,7 @@
 //! read pressure, tilt and eraser state in 100% safe Rust without disturbing
 //! `winit`'s own X11 event stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -138,24 +138,29 @@ fn primary_pressed(button_mask: &[u32], pressed_now: Option<(u32, bool)>) -> boo
     }
 }
 
-/// Safe XInput2 tablet listener attached to an X11 window.
+/// Safe XInput2 tablet listener attached to X11 windows.
 pub(crate) struct Tablet {
     conn: RustConnection,
     atom_pressure: Atom,
     atom_tilt_x: Atom,
     atom_tilt_y: Atom,
     devices: HashMap<u16, DeviceAxes>,
+    watched_windows: HashSet<u32>,
     touching: bool,
+}
+
+fn x11_window_id(window: &Window) -> Option<u32> {
+    let handle = window.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Xlib(h) => u32::try_from(h.window).ok(),
+        RawWindowHandle::Xcb(h) => Some(h.window.get()),
+        _ => None,
+    }
 }
 
 impl Tablet {
     pub(crate) fn open(window: &Arc<Window>) -> Option<Self> {
-        let handle = window.window_handle().ok()?;
-        let window_xid: u32 = match handle.as_raw() {
-            RawWindowHandle::Xlib(h) => u32::try_from(h.window).ok()?,
-            RawWindowHandle::Xcb(h) => h.window.get(),
-            _ => return None,
-        };
+        let window_xid = x11_window_id(window)?;
 
         let (conn, screen_num) = x11rb::connect(None).ok()?;
         let version = conn.xinput_xi_query_version(2, 2).ok()?.reply().ok()?;
@@ -196,16 +201,49 @@ impl Tablet {
         }
         conn.flush().ok()?;
 
+        let mut watched_windows = HashSet::new();
+        watched_windows.insert(window_xid);
         let mut tablet = Self {
             conn,
             atom_pressure,
             atom_tilt_x,
             atom_tilt_y,
             devices: HashMap::new(),
+            watched_windows,
             touching: false,
         };
         tablet.refresh_devices();
         Some(tablet)
+    }
+
+    /// Subscribes to XInput2 valuator events on an additional dialog or
+    /// floating-palette X11 window once.
+    pub(crate) fn watch_window(&mut self, window: &Window) {
+        let Some(window_xid) = x11_window_id(window) else {
+            return;
+        };
+        if !self.watched_windows.insert(window_xid) {
+            return;
+        }
+        if self
+            .conn
+            .xinput_xi_select_events(
+                window_xid,
+                &[EventMask {
+                    deviceid: Device::ALL_MASTER.into(),
+                    mask: vec![
+                        XIEventMask::MOTION
+                            | XIEventMask::BUTTON_PRESS
+                            | XIEventMask::BUTTON_RELEASE
+                            | XIEventMask::DEVICE_CHANGED
+                            | XIEventMask::LEAVE,
+                    ],
+                }],
+            )
+            .is_ok()
+        {
+            let _ = self.conn.flush();
+        }
     }
 
     fn refresh_devices(&mut self) {

@@ -27,6 +27,30 @@ struct Child {
     window: Arc<Window>,
     surface: Option<WindowSurface>,
     state: egui_winit::State,
+    /// Extra input events injected for this viewport (such as Wayland tablet
+    /// motion and clicks on a dialog or floating palette).
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )),
+        allow(dead_code)
+    )]
+    extra_events: Vec<egui::Event>,
+    #[cfg_attr(
+        not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )),
+        allow(dead_code)
+    )]
+    cursor_icon: egui::CursorIcon,
     /// Its close button was pressed: egui hears of it next frame.
     close: bool,
 }
@@ -64,6 +88,7 @@ pub(crate) fn install(ctx: &egui::Context, shared: &Shared) {
             match viewports.children.get_mut(&id) {
                 Some(child) => {
                     let mut raw = child.state.take_egui_input(&child.window);
+                    raw.events.append(&mut child.extra_events);
                     let info = raw.viewports.entry(id).or_default();
                     egui_winit::update_viewport_info(info, ctx, &child.window, false);
                     if std::mem::take(&mut child.close) {
@@ -100,6 +125,7 @@ pub(crate) fn install(ctx: &egui::Context, shared: &Shared) {
         let output = ctx.run_ui(raw, |ui| show(ui));
         let mut viewports = shared.borrow_mut();
         if let Some(child) = viewports.children.get_mut(&id) {
+            child.cursor_icon = output.platform_output.cursor_icon;
             child
                 .state
                 .handle_platform_output(&child.window, output.platform_output);
@@ -170,6 +196,8 @@ impl Viewports {
                     window,
                     surface,
                     state,
+                    extra_events: Vec::new(),
+                    cursor_icon: egui::CursorIcon::Default,
                     close: false,
                 },
             );
@@ -246,6 +274,50 @@ impl Viewports {
         let seen = std::mem::take(&mut self.seen);
         self.children.retain(|id, _| seen.contains(id));
         self.wanted.retain(|id, _| seen.contains(id));
+    }
+
+    /// Every open child viewport and its OS window.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pub(crate) fn windows(&self) -> Vec<(ViewportId, Arc<Window>)> {
+        self.children
+            .iter()
+            .map(|(id, child)| (*id, Arc::clone(&child.window)))
+            .collect()
+    }
+
+    /// Queues an input event for child viewport `id` on this frame.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pub(crate) fn push_event(&mut self, id: ViewportId, event: egui::Event) {
+        if let Some(child) = self.children.get_mut(&id) {
+            child.extra_events.push(event);
+        }
+    }
+
+    /// The last cursor icon requested by child viewport `id` and its integer
+    /// Wayland buffer scale.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pub(crate) fn cursor_for(&self, id: ViewportId) -> Option<(egui::CursorIcon, i32)> {
+        let child = self.children.get(&id)?;
+        let scale = child.window.scale_factor().round().max(1.0) as i32;
+        Some((child.cursor_icon, scale))
     }
 }
 

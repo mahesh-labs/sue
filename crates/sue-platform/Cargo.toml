@@ -61,6 +61,7 @@ windows.workspace = true
 # Pen position, pressure, tilt, barrel buttons and eraser on Linux and BSDs
 # (Wayland's tablet-v2 protocol and X11's XInput2, which winit does not carry).
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+rustix.workspace = true
 sue-wayland = { path = "wayland" }
 wayland-client.workspace = true
 wayland-cursor.workspace = true

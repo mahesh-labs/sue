@@ -37,33 +37,43 @@ mod imp {
         _window: Arc<Window>,
     }
 
+    /// Returns the Wayland protocol id (`wl_surface@...`) of `window` when
+    /// running on Wayland, or `None` on X11 and other backends.
+    #[must_use]
+    #[allow(
+        unsafe_code,
+        reason = "reads winit's live wl_surface proxy id; approved 2026-11-05"
+    )]
+    pub fn surface_id_of(window: &Window) -> Option<u32> {
+        let window_handle = window.window_handle().ok()?;
+        let RawWindowHandle::Wayland(surface) = window_handle.as_raw() else {
+            return None;
+        };
+        // SAFETY: `surface.surface` comes from `window.window_handle()` on a
+        // live `winit::window::Window`, so it is a valid, non-null
+        // `*mut wl_surface` (`*mut wl_proxy`) whose class matches
+        // `WlSurface::interface()` for the duration of this call. We only
+        // extract its numeric Wayland protocol id (`u32`).
+        let id =
+            unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast()) }
+                .ok()?;
+        Some(id.protocol_id())
+    }
+
     impl WindowConnection {
         /// Opens a guest Wayland connection on `window`'s display when `window`
         /// is a Wayland window, or returns `None` on X11 and other backends.
         #[must_use]
         #[allow(
             unsafe_code,
-            reason = "wraps winit's live wl_display and wl_surface pointers; approved 2026-11-05"
+            reason = "wraps winit's live wl_display pointer; approved 2026-11-05"
         )]
         pub fn open(window: &Arc<Window>) -> Option<Self> {
             let display_handle = window.display_handle().ok()?;
-            let window_handle = window.window_handle().ok()?;
-            let (RawDisplayHandle::Wayland(display), RawWindowHandle::Wayland(surface)) =
-                (display_handle.as_raw(), window_handle.as_raw())
-            else {
+            let RawDisplayHandle::Wayland(display) = display_handle.as_raw() else {
                 return None;
             };
-
-            // SAFETY: `surface.surface` comes from `window.window_handle()` on
-            // a live `winit::window::Window`, so it is a valid, non-null
-            // `*mut wl_surface` (`*mut wl_proxy`) whose class matches
-            // `WlSurface::interface()` for the duration of this call. We only
-            // extract its numeric Wayland protocol id (`u32`).
-            let surface_id = unsafe {
-                ObjectId::from_ptr(WlSurface::interface(), surface.surface.as_ptr().cast())
-            }
-            .ok()?
-            .protocol_id();
+            let surface_id = surface_id_of(window)?;
 
             // SAFETY: `display.display` comes from `window.display_handle()` on
             // `window`, so it is a valid `*mut wl_display` connected by
@@ -101,4 +111,4 @@ mod imp {
     target_os = "netbsd",
     target_os = "openbsd",
 ))]
-pub use imp::WindowConnection;
+pub use imp::{WindowConnection, surface_id_of};

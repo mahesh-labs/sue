@@ -245,6 +245,14 @@ pub struct DesktopHost {
         target_os = "openbsd",
     ))]
     pen: Option<UnixTablet>,
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    pen_wake: winit::event_loop::EventLoopProxy<Wake>,
 }
 
 #[cfg(any(
@@ -268,8 +276,8 @@ enum UnixTablet {
     target_os = "openbsd",
 ))]
 impl UnixTablet {
-    fn open(window: &Arc<Window>) -> Self {
-        if let Some(pen) = crate::wayland_pen::Pen::open(window) {
+    fn open(window: &Arc<Window>, proxy: winit::event_loop::EventLoopProxy<Wake>) -> Self {
+        if let Some(pen) = crate::wayland_pen::Pen::open(window, proxy) {
             Self::Wayland(pen)
         } else if let Some(tablet) = crate::x11_pen::Tablet::open(window) {
             Self::X11(tablet)
@@ -392,14 +400,37 @@ impl DesktopHost {
     fn create(
         event_loop: &ActiveEventLoop,
         options: &DesktopOptions,
+        proxy: winit::event_loop::EventLoopProxy<Wake>,
     ) -> Result<Self, PlatformError> {
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )))]
+        let _ = &proxy;
         let window = Self::open_window(event_loop, options)?;
         let (gpu, surface) = pollster::block_on(open_gpu(
             Arc::clone(&window),
             event_loop.owned_display_handle(),
             options.gpu,
         ))?;
-        Self::assemble(event_loop, window, gpu, surface, options)
+        Self::assemble(
+            event_loop,
+            window,
+            gpu,
+            surface,
+            options,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            proxy,
+        )
     }
 
     /// The host for a window whose GPU is open.
@@ -409,6 +440,14 @@ impl DesktopHost {
         gpu: GpuContext,
         surface: wgpu::Surface<'static>,
         options: &DesktopOptions,
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
+        pen_wake: winit::event_loop::EventLoopProxy<Wake>,
     ) -> Result<Self, PlatformError> {
         let size = window.inner_size();
         let surface = WindowSurface::new(surface, &gpu, size.width, size.height)?;
@@ -506,12 +545,19 @@ impl DesktopHost {
                 target_os = "openbsd",
             ))]
             pen: None,
+            #[cfg(any(
+                target_os = "linux",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "netbsd",
+                target_os = "openbsd",
+            ))]
+            pen_wake,
         })
     }
 
     /// Reads the pen on Wayland's `tablet-v2` protocol or X11's XInput2,
-    /// asking for a frame when it moved. Returns when the loop should look
-    /// again while the pen hovers over Sue's window.
+    /// asking for a frame when it moved.
     #[cfg(any(
         target_os = "linux",
         target_os = "freebsd",
@@ -519,23 +565,58 @@ impl DesktopHost {
         target_os = "netbsd",
         target_os = "openbsd",
     ))]
-    fn poll_pen(&mut self) -> Option<Instant> {
+    fn poll_pen(&mut self) {
+        let ppp = self.ctx.pixels_per_point();
         let scale_factor = self.window.scale_factor();
-        let to_points = scale_factor as f32 / self.ctx.pixels_per_point();
-        let scale = scale_factor.round().max(1.0) as i32;
+        let root_to_points = scale_factor as f32 / ppp;
+        let root_scale = scale_factor.round().max(1.0) as i32;
+        let child_windows = self.viewports.borrow().windows();
         let window = &self.window;
-        match self.pen.get_or_insert_with(|| UnixTablet::open(window)) {
+        let proxy = &self.pen_wake;
+        match self
+            .pen
+            .get_or_insert_with(|| UnixTablet::open(window, proxy.clone()))
+        {
             UnixTablet::Wayland(pen) => {
-                if pen.poll(to_points, scale) {
+                let mut surfaces = Vec::with_capacity(1 + child_windows.len());
+                surfaces.push(crate::wayland_pen::SurfaceTarget {
+                    surface_id: pen.root_surface_id(),
+                    viewport: egui::ViewportId::ROOT,
+                    to_points: root_to_points,
+                });
+                for (id, child_win) in &child_windows {
+                    if let Some(surface_id) = sue_wayland::surface_id_of(child_win) {
+                        surfaces.push(crate::wayland_pen::SurfaceTarget {
+                            surface_id,
+                            viewport: *id,
+                            to_points: child_win.scale_factor() as f32 / ppp,
+                        });
+                    }
+                }
+                if pen.poll(surfaces, root_scale) {
                     window.request_redraw();
                 }
-                pen.wake_after().map(|after| Instant::now() + after)
             }
             UnixTablet::X11(tablet) => {
+                for (_, child_win) in &child_windows {
+                    tablet.watch_window(child_win);
+                }
                 tablet.poll();
-                None
             }
-            UnixTablet::None => None,
+            UnixTablet::None => {}
+        }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+    ))]
+    fn arm_pen_wake(&self) {
+        if let Some(UnixTablet::Wayland(pen)) = self.pen.as_ref() {
+            pen.arm_wake();
         }
     }
 
@@ -593,7 +674,7 @@ impl DesktopHost {
             target_os = "netbsd",
             target_os = "openbsd",
         ))]
-        let _ = self.poll_pen();
+        self.poll_pen();
         #[cfg_attr(
             not(any(
                 target_os = "android",
@@ -628,7 +709,14 @@ impl DesktopHost {
                     _ => None,
                 })
                 .unwrap_or_else(|| self.ctx.input(|input| input.modifiers));
-            pen.take_events(modifiers, &mut raw.events);
+            let mut viewports = self.viewports.borrow_mut();
+            pen.take_events(modifiers, |viewport, event| {
+                if viewport == egui::ViewportId::ROOT {
+                    raw.events.push(event);
+                } else {
+                    viewports.push_event(viewport, event);
+                }
+            });
         }
         // Where the window is, so a dialog's own window opens over it.
         #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "ios")))]
@@ -672,7 +760,10 @@ impl DesktopHost {
             crate::stylus::end_frame();
             if let Some(UnixTablet::Wayland(pen)) = self.pen.as_mut() {
                 let scale = self.window.scale_factor().round().max(1.0) as i32;
-                pen.set_cursor(output.platform_output.cursor_icon, scale);
+                let viewports = self.viewports.borrow();
+                pen.set_cursors(output.platform_output.cursor_icon, scale, |vp| {
+                    viewports.cursor_for(vp)
+                });
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -857,7 +948,6 @@ pub fn run_desktop<A: DesktopApp + 'static>(
         last_frame: None,
         exiting: false,
         paused: false,
-        #[cfg(target_arch = "wasm32")]
         proxy: event_loop.create_proxy(),
         #[cfg(target_arch = "wasm32")]
         opening: None,
@@ -937,8 +1027,19 @@ struct Runner<A> {
     options: DesktopOptions,
     host: Option<DesktopHost>,
     error: Option<PlatformError>,
-    /// Reaches the loop from the browser's start-up.
-    #[cfg(target_arch = "wasm32")]
+    /// Reaches the loop from the browser's start-up or Wayland's tablet wake
+    /// watcher.
+    #[cfg_attr(
+        not(any(
+            target_arch = "wasm32",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        )),
+        allow(dead_code)
+    )]
     proxy: winit::event_loop::EventLoopProxy<Wake>,
     /// The canvas, while its GPU is being opened.
     #[cfg(target_arch = "wasm32")]
@@ -1126,8 +1227,8 @@ impl<A: DesktopApp> ApplicationHandler<Wake> for Runner<A> {
             self.last_frame,
             display_hz,
         );
-        // The pen's tablet protocol: read it now, and wake again soon while
-        // the pen hovers over the window.
+        // The pen's tablet protocol: drain any pending events now, and arm its
+        // socket watcher whenever the loop sleeps.
         #[cfg(any(
             target_os = "linux",
             target_os = "freebsd",
@@ -1135,14 +1236,30 @@ impl<A: DesktopApp> ApplicationHandler<Wake> for Runner<A> {
             target_os = "netbsd",
             target_os = "openbsd",
         ))]
-        let step = match (step, host.poll_pen()) {
-            (Step::Wait, Some(at)) => Step::WaitUntil(at),
-            (Step::WaitUntil(first), Some(at)) => Step::WaitUntil(first.min(at)),
-            (other, _) => other,
-        };
+        host.poll_pen();
         match step {
-            Step::Wait => event_loop.set_control_flow(ControlFlow::Wait),
-            Step::WaitUntil(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            Step::Wait => {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                ))]
+                host.arm_pen_wake();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Step::WaitUntil(at) => {
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                ))]
+                host.arm_pen_wake();
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
             Step::Redraw => {
                 host.window.request_redraw();
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -1181,7 +1298,24 @@ impl<A: DesktopApp> ApplicationHandler<Wake> for Runner<A> {
         #[cfg(target_arch = "wasm32")]
         self.open_in_browser(event_loop);
         #[cfg(not(target_arch = "wasm32"))]
-        self.begin(event_loop, DesktopHost::create(event_loop, &self.options));
+        self.begin(
+            event_loop,
+            DesktopHost::create(event_loop, &self.options, self.proxy.clone()),
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): Wake) {
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "dragonfly",
+            target_os = "netbsd",
+            target_os = "openbsd",
+        ))]
+        if let Some(host) = self.host.as_mut() {
+            host.poll_pen();
+        }
     }
 
     /// The browser's start-up is done: the page's files are read and the
